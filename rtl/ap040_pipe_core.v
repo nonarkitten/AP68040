@@ -279,13 +279,14 @@ ap040_pipe_regfile u_regfile
 //---------------------------------------------------------------------------
 
 // Unified L1. Port A is IF's (milestone 9a). Port B is EA-fetch's data
-// read (milestone 9b, new) -- write side (data_b/wren_b) still tied off:
-// nothing writes memory yet, reserved for a future store instruction the
-// same "reserved, not speculative" way raddr_b was until Scc needed it.
+// read (milestone 9b, new) -- write side (data_b/wren_b/wr_busy) still tied
+// off: nothing writes memory yet, reserved for a future store instruction
+// the same "reserved, not speculative" way raddr_b was until Scc needed it.
 wire [L1_AW-1:0] l1_addr_a;
 wire      [15:0] l1_rdata_a;
 wire [L1_AW-1:0] l1_addr_b;
 wire       [31:0] l1_q_b;
+wire              l1_wr_busy;
 
 ap040_pipe_l1 #(
 	.AW(L1_AW),
@@ -293,6 +294,7 @@ ap040_pipe_l1 #(
 ) u_l1
 (
 	.clock     (clk),
+	.nreset    (nreset),
 
 	.address_a (l1_addr_a),
 	.data_a    (16'h0),
@@ -307,6 +309,7 @@ ap040_pipe_l1 #(
 	.address_b (l1_addr_b),
 	.data_b    (32'h0),
 	.wren_b    (1'b0),
+	.wr_busy   (l1_wr_busy),
 	.q_b       (l1_q_b)
 );
 

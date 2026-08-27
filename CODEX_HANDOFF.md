@@ -221,3 +221,55 @@ path, `wren_b`/`data_b` already reserved but undriven; a second write
 source into the regfile alongside `commit_reg`). JSR becomes close to free
 once BSR's write mechanism exists -- it's JMP's EA resolution (already
 built) plus BSR's push (about to be built).
+
+## 2026-08-27 (later still): milestone 12, L1 posted write buffer
+
+User asked, before wiring BSR's push, to make sure the write PATH itself
+was right first: a real buffer (1 entry, nothing wider than 32-bit is
+needed), so a store doesn't force the pipeline to stall hard if port B is
+otherwise busy. Built it into `ap040_pipe_l1.v` -- `wren_b`/`data_b` now
+POST into a real 1-entry buffer (`wbuf_valid`/`wbuf_addr`/`wbuf_data`),
+drained into `mem[]` with priority over accepting a new post, plus
+read-after-write forwarding so a load can't see stale data behind an
+undrained store. `wr_busy` exposes backpressure; bounded to two edges
+worst-case (drain, then accept), one edge once already observed clear --
+full reasoning, including why the "one cycle" claim in an early draft was
+wrong by exactly one edge, is in `AP040_IMPLEMENTATION_PLAN.md`'s
+milestone-12 writeup, right after 11's.
+
+No pipeline instruction drives `wren_b` yet (BSR still needs to be wired
+up to actually USE this), so this got its own standalone testbench,
+`tb_ap040_pipe_l1_wbuf.v`, instantiating `ap040_pipe_l1.v` directly rather
+than the full `ap040_pipe_core.v` -- the first test in this suite to do
+that; `tb/run_pipe_tests.sh` special-cases its (much smaller) source list
+accordingly.
+
+Three real bugs surfaced, all documented in detail in the plan doc since
+the next session needs the full reasoning, not just the summary:
+1. **A genuine RTL bug**: `wbuf_valid` had no reset (this module never
+   needed one before), so it read `X` at time 0 and stayed `X` forever
+   with nothing to write it -- which poisoned `q_b` via the forwarding
+   ternary on reads that had NOTHING to do with any write, breaking two
+   already-passing tests the moment this milestone's code landed. Fixed
+   by giving the module a real `nreset`, gating `wbuf_valid` only (`q_a`/
+   `q_b`/`mem[]` keep the original no-reset treatment).
+2. **A testbench race** (active-region vs. NBA-region, reading `wr_busy`
+   or asserting new stimulus in the same instant a process resumes from
+   `@(posedge clk)`) that passed one check by scheduling luck while an
+   identically-shaped later check failed -- fixed with `#1` after every
+   edge, applied uniformly rather than only where a failure surfaced.
+3. **A testbench message-truncation bug**: `check1`/`check32` used
+   `[255:0]` for the failure message and silently truncated anything over
+   32 characters to its TAIL, which actively misled the first round of
+   debugging (garbled but plausible-looking wrong text, not an obvious
+   truncation). Fixed with SystemVerilog's `string` type.
+
+All three real RTL mechanisms (forwarding, drain-priority, the reset fix)
+mutation-tested independently and caught cleanly. Full 13-file
+`run_pipe_tests.sh` green.
+
+Next: actually wire BSR's push through this new path -- EA-fetch/EX needs
+to drive `wren_b`/`address_b`(the L1 word index for `A7-4`)/`data_b`(the
+return address) respecting `wr_busy`, plus a second, non-ALU register-write
+source into the regfile for A7's decrement (alongside `commit_reg`'s
+existing one). See `AP040_IMPLEMENTATION_PLAN.md` section 6 item 2.

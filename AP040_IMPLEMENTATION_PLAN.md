@@ -99,10 +99,12 @@ Completed milestones (`tb/run_pipe_tests.sh`, one file per milestone):
 | 9b | MOVE.L (An),Dn -- first memory read, first genuine pipeline stall | `tb_ap040_pipe_move_mem.v` |
 | 10 | MOVE.L (d16,An),Dn -- first real EA displacement arithmetic; found and fixed a real L1/stall bug (see below) | `tb_ap040_pipe_move_disp.v` |
 | 11 | JMP (An), JMP (d16,An) -- EA-computed PC redirect, reusing EX's mispredict/recovery mechanism unconditionally | `tb_ap040_pipe_jmp.v` |
+| 12 | `ap040_pipe_l1.v` posted write buffer (port B write side, ahead of BSR/JSR) | `tb_ap040_pipe_l1_wbuf.v` |
 
 Register-direct/immediate/register-indirect(+displacement) only -- no
-indexed/absolute/PC-relative EA modes, no byte/word sizes, no memory
-writes, no BSR/JSR (need a memory write) yet. See section 6.
+indexed/absolute/PC-relative EA modes, no byte/word sizes, no BSR/JSR yet
+(the memory *write path* now exists at the L1 level -- section 6 item 2 is
+next: actually issuing a write from EA-fetch/EX). See section 6.
 
 ## 5a. The unified-L1 decision (2026-08-27)
 
@@ -317,9 +319,84 @@ value, but worth remembering: any test chaining multiple JMP/Bcc
 mispredictions needs a substantially larger budget than instruction count
 alone would suggest.
 
+**DONE (milestone 12, 2026-08-27): posted write buffer on `ap040_pipe_l1.v`
+port B**, ahead of actually wiring BSR/JSR's stack push, per the user's
+explicit request: get the write PATH right first, not as an afterthought
+bolted onto the first store instruction.
+
+- **Why a buffer at all.** Port B is a single read/write port -- one
+  address bus serving both `q_b`'s read request and `wren_b`'s write
+  request. Without buffering, a store landing the same cycle port B is
+  needed for something else (a concurrent read, or an earlier store still
+  landing) would force the WHOLE PIPELINE to stall until the port frees
+  up. A 1-entry buffer (`wbuf_valid`/`wbuf_addr`/`wbuf_data` -- one 32-bit
+  longword; per the user, nothing wider is needed, this core never posts
+  more than one store's worth at a time) decouples that: `wren_b` POSTS a
+  write, accepted immediately whenever the buffer is empty, and the
+  requester can move on without waiting for the physical `mem[]` write to
+  land -- the same "commit, don't wait for the backing store" contract a
+  real store buffer gives a pipeline.
+- **Bounded, not indefinite, wait.** Draining an already-posted write and
+  accepting a genuinely new one are mutually exclusive per edge (they're
+  sequenced, not simultaneous), so a request arriving while the buffer is
+  already busy needs up to two edges from when it FIRST starts waiting:
+  one for the old entry to drain, one more to actually accept the new
+  one. From the moment `wr_busy` is observed to have already dropped,
+  though, a held request is accepted on the very next edge. A first draft
+  of both the RTL's own comment and the test's cycle-accounting claimed a
+  flat "one cycle" bound, which was wrong by exactly one edge for the
+  back-to-back case -- caught by the test itself, not asserted past it.
+- **Read-after-write forwarding.** A read whose address matches an
+  undrained buffered write returns the buffered value, not stale `mem[]`
+  content. Not reachable by any instruction implemented yet (nothing
+  reads memory in the same window a store's write might still be
+  buffered -- `RTS`, a stack pop, will be the first), built anyway since
+  it's the module genuinely responsible for the guarantee and it's cheap;
+  don't let it go untested indefinitely once something actually depends
+  on it.
+- **`wren_b` unconditionally accepted for now.** In this behavioral model
+  there is no real port contention beyond the buffer's own single entry
+  (draining and reading a DIFFERENT address coexist fine -- Verilog lets
+  a behavioral array be written and read at different indices in the same
+  block; a real BRAM's actual port count is exactly the kind of thing the
+  future BCU has to arbitrate for real, not this module). `wr_busy` is
+  real and correctly computed, but nothing in this repo can currently
+  drive it to reject a write for longer than the two-edge bound above.
+- **A real bug, caught immediately by the existing suite going X the
+  moment this milestone's code was added**: `ap040_pipe_l1.v` never had
+  an `nreset` before (`q_a`/`q_b` are pure data outputs with no meaningful
+  reset value while nothing downstream trusts them yet -- matching real
+  BRAM read ports). `wbuf_valid` is different: it's genuine CONTROL
+  state, and Verilog gives an un-reset reg `X` at time 0 -- which
+  propagated through the read-forwarding ternary and poisoned `q_b` on
+  reads that had nothing to do with any write, breaking
+  `tb_ap040_pipe_move_mem.v`/`tb_ap040_pipe_move_disp.v` immediately.
+  Fixed by giving the module the same `nreset` every other stateful pipe
+  module already has, gating `wbuf_valid` specifically (`mem[]`/`q_a`/
+  `q_b` keep their original no-reset treatment -- they're still pure
+  data).
+- **Two testbench-only bugs, not RTL, both worth remembering**: (1) a
+  classic active-region-vs-NBA-region race reading `wr_busy` (or setting
+  new stimulus) in the SAME simulation instant a testbench process
+  resumes from `@(posedge clk)` -- the fix applied everywhere in
+  `tb_ap040_pipe_l1_wbuf.v` is `#1` after every edge before touching
+  anything DUT-driven, not just where a failure happened to surface (an
+  early version passed one check by scheduling luck while an
+  IDENTICALLY-shaped later check failed). (2) `check1`/`check32`'s
+  message parameter was declared `[255:0]` (32 characters) and silently
+  truncated every longer message to its tail, actively misleading the
+  first round of debugging by showing a garbled, wrong-looking failure
+  reason; fixed by switching to SystemVerilog's unbounded `string` type
+  (already available, `-g2012` is required for this whole suite anyway).
+
+All three real mechanisms (read-after-write forwarding, drain-before-
+accept priority, and the `nreset` fix) were mutation-tested independently
+and caught cleanly; the `nreset` mutation reproduces the exact original
+`X`-propagation symptom. Full 13-file `run_pipe_tests.sh` green.
+
 ## 5. Verification discipline (keep doing this)
 
-This is what has actually kept the pipeline correct across eleven milestones
+This is what has actually kept the pipeline correct across twelve milestones
 of rewrites; don't relax it for speed:
 
 - **Bit-exact opcode/semantics verification against `rtl_old`.** Every
@@ -353,6 +430,21 @@ of rewrites; don't relax it for speed:
   When adding a new stall source, deliberately construct a test where it
   overlaps something else already in flight, not just a test of the new
   stall by itself.
+- **`#1` after every `@(posedge clk)` before touching anything DUT-driven,
+  no exceptions.** Milestone 12's write-buffer test lost real debugging
+  time to an active-region-vs-NBA-region race: reading a signal (or
+  setting new stimulus) in the same simulation instant a testbench
+  process resumes from an edge can see pre-edge state, and WHICH checks
+  are affected is simulator-scheduling-order-dependent -- one check can
+  pass by luck while a structurally identical one fails. Apply `#1`
+  uniformly, not just where a failure happened to show up.
+- **Give test-helper task message parameters an unbounded `string` type,
+  not a fixed-width `[N:0]` vector.** The SAME milestone's `check1`/
+  `check32` tasks used `[255:0]` and silently truncated every message
+  over 32 characters to its TAIL, actively misleading debugging (a
+  garbled, plausible-looking wrong message, not an obvious truncation
+  error). `-g2012` is already required for this whole suite; `string`
+  costs nothing extra.
 
 ## 6. Remaining scope, roughly in dependency order
 
@@ -363,21 +455,25 @@ of rewrites; don't relax it for speed:
    the update commits relative to a fault), then indexed/absolute/
    PC-relative.
 2. **DONE (milestone 11): `JMP (An)`, `JMP (d16,An)`** -- see the writeup
-   above section 5. **`BSR`/`JSR` are the natural next step and still
-   NOT done** -- unlike JMP, both need the pipeline's first real memory
-   *write* (the return-address push to `-(A7)`) plus a register side
-   effect (A7's decrement) that isn't the instruction's primary ALU
-   result, landing on the SAME instruction as a memory access. That's
-   more new machinery than JMP needed, not less: expect it to need an
-   actual write path on `ap040_pipe_l1.v` port B (the module already has
-   `wren_b`/`data_b`, reserved but never driven by any stage yet) and a
-   second, non-ALU register-write source feeding the regfile write port
-   alongside `commit_reg`'s existing one. `RTS` (a read from `(A7)+`,
-   register-indirect-postincrement into the PC) is the natural close-out
-   once a write exists to test push/pop symmetry against. Once BSR's write
-   mechanism exists, JSR is close to free -- it's JMP's EA resolution
-   (already built) plus BSR's push (about to be built), not a new
-   mechanism of its own.
+   above section 5. **DONE (milestone 12): the write PATH itself** --
+   `ap040_pipe_l1.v` port B now has a real posted write buffer
+   (`wren_b`/`data_b`/`wr_busy`, 1 entry, drain-then-accept, read-after-
+   write forwarding) -- see the writeup above section 5. **`BSR`/`JSR`
+   are still NOT done** -- what's left is wiring an actual WRITE REQUEST
+   from EA-fetch/EX into that path (the push itself: address = `A7-4`,
+   data = the return address) plus a register side effect (A7's decrement)
+   that isn't the instruction's primary ALU result, landing on the SAME
+   instruction as the memory access. Expect: a second, non-ALU
+   register-write source feeding the regfile write port alongside
+   `commit_reg`'s existing one, and EA-fetch/EX driving `wren_b`/
+   `address_b`(the L1 word index)/`data_b` while respecting `wr_busy`
+   (hold stable, same contract `mem_issue`'s read side already
+   established). `RTS` (a read from `(A7)+`, register-indirect-
+   postincrement into the PC) is the natural close-out once a write
+   exists to test push/pop symmetry against. Once BSR's write issue
+   exists, JSR is close to free -- it's JMP's EA resolution (already
+   built) plus BSR's push (write path now built, issue side still
+   needed), not a new mechanism of its own.
 2b. **DBcc's deferred odd-target address-error** and **TRAPcc** both need
    the next item before they can be finished, not before they can be
    started -- see their notes in `ap040_execute.v`/`AP040_IMPLEMENTATION_PLAN.md`
