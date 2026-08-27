@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 13: BSR, JSR)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 14: exceptions)     //
 //                                                                          //
 // ap040_pipe_core.v - top level: wires IF/ID/EA-calc/EA-fetch/EX/WB into a //
 // real six-stage pipeline with a synchronous stall/flush chain,            //
@@ -144,15 +144,8 @@ wire [31:0] id_imm;
 wire  [5:0] id_alu_op;
 wire        id_src_a_is_imm, id_writes_reg, id_writes_ccr;
 wire        id_is_branch, id_is_scc, id_is_dbcc, id_is_mem_src, id_is_jmp;
-wire        id_is_bsr, id_is_jsr;
+wire        id_is_bsr, id_is_jsr, id_is_trap, id_is_illegal;
 wire  [3:0] id_cond;
-// id_unimpl: decode's "opcode not recognized" bit. Not consumed past decode
-// yet -- nothing traps on it (writes_reg=0 already makes an unrecognized
-// opcode inert) -- kept as a real output, not threaded further, because the
-// illegal-instruction-exception milestone needs it and re-deriving "which
-// opcodes decode() actually classifies" from scratch at that point would be
-// wasted work. Reserved the same way raddr_b is below, not dead.
-wire        id_unimpl;
 
 wire        eac_valid; wire [31:0] eac_pc; wire [31:0] eac_next_pc;
 wire  [3:0] eac_dest_reg, eac_src_reg;
@@ -160,7 +153,7 @@ wire [31:0] eac_imm;
 wire  [5:0] eac_alu_op;
 wire        eac_src_a_is_imm, eac_writes_reg, eac_writes_ccr;
 wire        eac_is_branch, eac_is_scc, eac_is_dbcc, eac_is_mem_src, eac_is_jmp;
-wire        eac_is_bsr, eac_is_jsr;
+wire        eac_is_bsr, eac_is_jsr, eac_is_trap, eac_is_illegal;
 wire  [3:0] eac_cond;
 
 wire        eaf_valid; wire [31:0] eaf_pc; wire [31:0] eaf_next_pc;
@@ -169,7 +162,7 @@ wire [31:0] eaf_operand_a, eaf_operand_b;
 wire  [5:0] eaf_alu_op;
 wire        eaf_writes_reg, eaf_writes_ccr;
 wire        eaf_is_branch, eaf_is_scc, eaf_is_dbcc, eaf_is_jmp;
-wire        eaf_is_bsr, eaf_is_jsr;
+wire        eaf_is_bsr, eaf_is_jsr, eaf_is_trap, eaf_is_illegal;
 wire  [3:0] eaf_cond;
 
 wire        exe_valid; wire [31:0] exe_pc;
@@ -386,8 +379,9 @@ ap040_decode u_id
 	.id_is_jmp       (id_is_jmp),
 	.id_is_bsr       (id_is_bsr),
 	.id_is_jsr       (id_is_jsr),
-	.id_cond         (id_cond),
-	.id_unimpl       (id_unimpl)
+	.id_is_trap      (id_is_trap),
+	.id_is_illegal   (id_is_illegal),
+	.id_cond         (id_cond)
 );
 
 ap040_ea_calc u_eac
@@ -415,6 +409,8 @@ ap040_ea_calc u_eac
 	.id_is_jmp        (id_is_jmp),
 	.id_is_bsr        (id_is_bsr),
 	.id_is_jsr        (id_is_jsr),
+	.id_is_trap       (id_is_trap),
+	.id_is_illegal    (id_is_illegal),
 	.id_cond          (id_cond),
 
 	.ea_stall         (ea_stall),
@@ -436,6 +432,8 @@ ap040_ea_calc u_eac
 	.eac_is_jmp       (eac_is_jmp),
 	.eac_is_bsr       (eac_is_bsr),
 	.eac_is_jsr       (eac_is_jsr),
+	.eac_is_trap      (eac_is_trap),
+	.eac_is_illegal   (eac_is_illegal),
 	.eac_cond         (eac_cond)
 );
 
@@ -467,7 +465,11 @@ ap040_ea_fetch #(
 	.eac_is_jmp       (eac_is_jmp),
 	.eac_is_bsr       (eac_is_bsr),
 	.eac_is_jsr       (eac_is_jsr),
+	.eac_is_trap      (eac_is_trap),
+	.eac_is_illegal   (eac_is_illegal),
 	.eac_cond         (eac_cond),
+
+	.ccr_in           (ccr_resolved),
 
 	.raddr_a          (raddr_a),
 	.rdata_a          (rdata_a),
@@ -501,6 +503,8 @@ ap040_ea_fetch #(
 	.eaf_is_jmp       (eaf_is_jmp),
 	.eaf_is_bsr       (eaf_is_bsr),
 	.eaf_is_jsr       (eaf_is_jsr),
+	.eaf_is_trap      (eaf_is_trap),
+	.eaf_is_illegal   (eaf_is_illegal),
 	.eaf_cond         (eaf_cond)
 );
 
@@ -526,6 +530,8 @@ ap040_execute u_ex
 	.eaf_is_jmp       (eaf_is_jmp),
 	.eaf_is_bsr       (eaf_is_bsr),
 	.eaf_is_jsr       (eaf_is_jsr),
+	.eaf_is_trap      (eaf_is_trap),
+	.eaf_is_illegal   (eaf_is_illegal),
 	.eaf_cond         (eaf_cond),
 
 	.ccr_in           (ccr_resolved),

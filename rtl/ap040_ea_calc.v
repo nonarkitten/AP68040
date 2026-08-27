@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 13: BSR, JSR)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 14: exceptions)       //
 //                                                                          //
 // ap040_ea_calc.v - EA-calc stage                                         //
 //                                                                          //
@@ -32,6 +32,14 @@
 // (port B) -- id_is_bsr/id_is_jsr just thread through here unchanged, same  //
 // as every other flag.                                                     //
 //                                                                          //
+// TRAP #n / illegal instruction (milestone 14, new): same story a third     //
+// time. Both need A7's value (port B, id_dest_reg already pointed at A7 by   //
+// ap040_decode.v, same trick BSR/JSR use) and nothing else EA-calc could      //
+// compute -- the frame contents, the multi-beat push, and the vector-table    //
+// read all live in ap040_ea_fetch.v's new exception-entry sequencer. id_is_    //
+// trap/id_is_illegal just thread through unchanged, same shape as every       //
+// other flag above.                                                          //
+//                                                                          //
 // flush: when ap040_execute.v detects a mispredicted branch, everything     //
 // speculatively fetched behind it -- including whatever is sitting here -- //
 // must be discarded. Same shape as stall_in but forces a bubble instead     //
@@ -63,6 +71,8 @@ module ap040_ea_calc
 	input             id_is_jmp,
 	input             id_is_bsr,
 	input             id_is_jsr,
+	input             id_is_trap,
+	input             id_is_illegal,
 	input       [3:0] id_cond,
 
 	output            ea_stall,   // to ID: no local stall of its own yet
@@ -84,6 +94,8 @@ module ap040_ea_calc
 	output reg        eac_is_jmp,
 	output reg        eac_is_bsr,
 	output reg        eac_is_jsr,
+	output reg        eac_is_trap,
+	output reg        eac_is_illegal,
 	output reg  [3:0] eac_cond
 );
 
@@ -108,6 +120,8 @@ always @(posedge clk) begin
 		eac_is_jmp       <= 1'b0;
 		eac_is_bsr       <= 1'b0;
 		eac_is_jsr       <= 1'b0;
+		eac_is_trap      <= 1'b0;
+		eac_is_illegal   <= 1'b0;
 		eac_cond         <= 4'h0;
 	end else if (ce) begin
 		if (flush) begin
@@ -130,6 +144,8 @@ always @(posedge clk) begin
 			eac_is_jmp       <= id_is_jmp;
 			eac_is_bsr       <= id_is_bsr;
 			eac_is_jsr       <= id_is_jsr;
+			eac_is_trap      <= id_is_trap;
+			eac_is_illegal   <= id_is_illegal;
 			eac_cond         <= id_cond;
 		end
 	end

@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 13: BSR, JSR)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 14: exceptions)       //
 //                                                                          //
 // ap040_ea_fetch.v - EA-fetch stage                                       //
 //                                                                          //
@@ -155,6 +155,49 @@
 //   not the generic ALU" pattern DBcc's decrement and Scc's byte-merge already use;                  //
 //   see its header for why the generic ALU wasn't used here either -- eaf_operand_a                   //
 //   is busy carrying JSR's redirect target and can't also carry a "4" operand).                        //
+//                                                                            //
+// TRAP #n / illegal instruction (milestone 14, new): this pipeline's first     //
+// exception entry, and its first multi-beat memory sequence -- BSR/JSR's push    //
+// was exactly one write; a format-$0 frame is TWO (SR:PC_hi, then PC_lo:         //
+// FmtVec), followed by a THIRD access, a plain read, to fetch the handler          //
+// address out of the vector table. A small state register (exc_ph, BEAT0/          //
+// BEAT1/VECRD) sequences these three L1 accesses one at a time; eac_* stays          //
+// frozen throughout via exc_stall feeding eaf_stall, the SAME freeze-on-stall         //
+// mechanism every multi-cycle operation in this stage already uses (mem_issue/        //
+// wr_stall above). Each beat reuses wr_stall's own accept-when-!l1_wr_busy idiom       //
+// independently (retried every cycle it's needed, exactly like BSR/JSR's single        //
+// write already does) rather than a new handshake shape.                                //
+//                                                                            //
+// Frame contents (format $0 only this milestone -- see ap040_decode.v's header    //
+// for why address-error's format $2 is deferred to its own milestone):             //
+//   SR word:  this pipeline has no real T1/T0/M/IPL state (sr_s/sr_m are            //
+//             hardwired in ap040_pipe_core.v), so the system byte is a fixed        //
+//             8'b0010_0000 (S=1, everything else 0, matching AP040_SR_RESET's        //
+//             S=1/M=0) -- ccr_in supplies the real, live low byte (this stage's       //
+//             CCR forwarding source, same signal ap040_execute.v's Bcc/Scc            //
+//             condition check already uses -- see ap040_pipe_core.v).                  //
+//   PC field: id_pc (the faulting instruction's OWN address) for illegal --             //
+//             you can't "return past" an illegal opcode -- id_next_pc (the               //
+//             FOLLOWING instruction, TRAP's actual return address) for TRAP,              //
+//             the same subroutine-call semantics BSR/JSR's return-address push             //
+//             already established. Verified against ap040_core.v's go_illegal              //
+//             (spc=pc_i, its own convention for "current instruction's address")             //
+//             vs. its vector-32+n TRAP dispatch (spc=pc, its convention for "the              //
+//             next instruction" -- see that file for the pc/pc_i distinction).                //
+//   Format/vector-offset word: {format(4)=0, 00, vector(8), 00} -- vector*4 falls               //
+//             naturally out of this bit placement, no explicit shift needed.                     //
+//                                                                            //
+// Vector fetch: this substrate has no real VBR register (no MOVEC, no control        //
+// registers at all yet) and, unlike a real 68040, no separate low-memory region       //
+// distinct from ap040_pipe_l1.v's PC_RESET-relative window -- vector*4 is used         //
+// as an ABSOLUTE address, fed through the exact SAME `l1_addr_word - PC_RESET) >>       //
+// 1` conversion every other address on this port already goes through. This is          //
+// not a special case: PC_RESET's own value (0x400 in every testbench so far,             //
+// deliberately -- exactly the byte size of a full 256-entry 68k vector table) was          //
+// already chosen with headroom for the vector table to occupy the address range              //
+// BELOW it, and the unsigned wraparound in that subtraction lands vector*4 in the              //
+// mathematically-correct modular slot of the SAME L1 array with zero new address               //
+// logic -- confirmed arithmetically, not assumed, before relying on it.                          //
 //--------------------------------------------------------------------------//
 
 module ap040_ea_fetch
@@ -186,7 +229,14 @@ module ap040_ea_fetch
 	input             eac_is_jmp,
 	input             eac_is_bsr,
 	input             eac_is_jsr,
+	input             eac_is_trap,
+	input             eac_is_illegal,
 	input       [3:0] eac_cond,
+
+	// Architectural CCR, write-through forwarded -- see
+	// ap040_pipe_core.v's ccr_resolved. Needed only to synthesize the SR
+	// word an exception frame pushes -- see header.
+	input       [4:0] ccr_in,
 
 	// regfile operand read ports (driven combinationally by this stage;
 	// ap040_pipe_core.v wires raddr_a/b <-> rdata_a/b straight to the
@@ -226,6 +276,8 @@ module ap040_ea_fetch
 	output reg        eaf_is_jmp,
 	output reg        eaf_is_bsr,
 	output reg        eaf_is_jsr,
+	output reg        eaf_is_trap,
+	output reg        eaf_is_illegal,
 	output reg  [3:0] eaf_cond
 );
 
@@ -241,7 +293,24 @@ wire mem_complete = mem_pending;
 wire eac_is_push  = eac_is_bsr || eac_is_jsr;
 wire wr_stall     = eac_valid && eac_is_push && l1_wr_busy;
 
-assign eaf_stall = stall_in || mem_issue || wr_stall;
+// TRAP #n / illegal instruction exception entry -- see header. exc_ph
+// sequences the frame's two writes and the vector-table read one at a time;
+// exc_vec_pending mirrors mem_pending's own shape for the read's one-cycle
+// latency.
+localparam EXC_BEAT0 = 2'd0, EXC_BEAT1 = 2'd1, EXC_VECRD = 2'd2;
+reg [1:0] exc_ph;
+reg       exc_vec_pending;
+
+wire eac_is_exc    = eac_is_trap || eac_is_illegal;
+wire exc_active    = eac_valid && eac_is_exc;
+wire exc_writing   = exc_active && !exc_vec_pending &&
+                      (exc_ph == EXC_BEAT0 || exc_ph == EXC_BEAT1);
+wire exc_beat_ack  = exc_writing && !l1_wr_busy;    // this beat accepted THIS cycle
+wire exc_vec_issue = exc_active && !exc_vec_pending && (exc_ph == EXC_VECRD);
+wire exc_vec_done  = exc_active && exc_vec_pending;
+wire exc_stall     = exc_active && !exc_vec_done;
+
+assign eaf_stall = stall_in || mem_issue || wr_stall || exc_stall;
 assign raddr_a    = eac_src_reg;
 assign raddr_b    = eac_dest_reg;
 
@@ -277,16 +346,46 @@ wire [31:0] ea_target = operand_a + eac_imm;
 // set eac_dest_reg to A7's unified index for both -- see header).
 wire [31:0] push_addr = operand_b - 32'd4;
 
+// TRAP #n / illegal instruction: A7's NEW value after a format-$0 (8-byte)
+// frame -- same "operand_b via port B" trick, decode having pointed
+// eac_dest_reg at A7 for these too. Recomputed live off eac_/ccr_in every
+// cycle of the sequence rather than latched once: eac_* is frozen by
+// exc_stall the whole time anyway (nothing downstream can change it), so a
+// latch would just be a redundant copy -- see header.
+wire [31:0] exc_new_sp     = operand_b - 32'd8;
+wire [15:0] exc_sr_word    = {8'b0010_0000, 3'b000, ccr_in};
+wire [31:0] exc_pc_field   = eac_is_illegal ? eac_pc : eac_next_pc;
+wire  [7:0] exc_vec_num    = eac_is_illegal ? 8'd4 : eac_imm[7:0];
+wire [15:0] exc_vecoff_word = {4'd0, 2'b00, exc_vec_num, 2'b00};
+
+// Beat0 @ exc_new_sp: SR, then PC's high word. Beat1 @ exc_new_sp+4: PC's
+// low word, then the format/vector-offset word -- four 16-bit frame words
+// packed into two 32-bit L1 writes, see header.
+wire [31:0] exc_beat_addr = (exc_ph == EXC_BEAT1) ? (exc_new_sp + 32'd4) : exc_new_sp;
+wire [31:0] exc_wdata     = (exc_ph == EXC_BEAT0)
+                             ? {exc_sr_word, exc_pc_field[31:16]}
+                             : {exc_pc_field[15:0], exc_vecoff_word};
+
+// Vector table address: vector*4, used as an ABSOLUTE address fed through
+// the SAME PC_RESET-relative conversion below -- see header for why no
+// special-casing (a real VBR, a separate low-memory region) is needed.
+wire [31:0] exc_vec_addr = {22'd0, exc_vec_num, 2'b00};
+
 // Driven unconditionally, same "compute always, gate consumption" precedent
-// as raddr_b -- harmless when neither eac_is_mem_src/eac_is_jmp nor
-// eac_is_push is set, nothing reads l1_q_b or l1_wr_busy that cycle.
+// as raddr_b -- harmless when none of eac_is_mem_src/eac_is_jmp/eac_is_push/
+// eac_is_exc is set, nothing reads l1_q_b or l1_wr_busy that cycle.
 // PC_RESET-relative to match ap040_inst_fetch.v's own L1 addressing -- see
-// header. Selects between a READ target (memory-source or JMP/JSR's
-// redirect) and the PUSH address -- mutually exclusive by construction.
-wire [31:0] l1_addr_word = eac_is_push ? push_addr : ea_target;
+// header. Four-way select: a READ target (memory-source or JMP/JSR's
+// redirect), the BSR/JSR PUSH address, an exception frame WRITE beat, or the
+// exception's own vector-table READ -- mutually exclusive by construction
+// (an instruction is never more than one of these at once).
+wire [31:0] l1_addr_word = eac_is_push  ? push_addr :
+                            exc_writing ? exc_beat_addr :
+                            (exc_vec_issue || exc_vec_pending) ? exc_vec_addr :
+                                                                  ea_target;
 assign l1_addr_b = (l1_addr_word - PC_RESET) >> 1;
-assign l1_wren_b = eac_valid && eac_is_push;
-assign l1_data_b = eac_next_pc;
+assign l1_wren_b = (eac_valid && eac_is_push) || exc_writing;
+assign l1_data_b = exc_writing ? exc_wdata : eac_next_pc;
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -305,12 +404,24 @@ always @(posedge clk) begin
 		eaf_is_jmp     <= 1'b0;
 		eaf_is_bsr     <= 1'b0;
 		eaf_is_jsr     <= 1'b0;
+		eaf_is_trap    <= 1'b0;
+		eaf_is_illegal <= 1'b0;
 		eaf_cond       <= 4'h0;
 		mem_pending    <= 1'b0;
+		exc_ph          <= EXC_BEAT0;
+		exc_vec_pending <= 1'b0;
 	end else if (ce) begin
 		if (flush) begin
-			eaf_valid   <= 1'b0;
-			mem_pending <= 1'b0;
+			eaf_valid       <= 1'b0;
+			mem_pending     <= 1'b0;
+			// Abandon a mid-flight exception sequence the same way an
+			// abandoned mem_pending read is: nothing downstream of a flush
+			// consumes what was in progress, but exc_ph/exc_vec_pending
+			// MUST reset here too, or the next (unrelated) exception
+			// instruction would resume mid-sequence instead of starting at
+			// beat0.
+			exc_ph          <= EXC_BEAT0;
+			exc_vec_pending <= 1'b0;
 		end else if (!stall_in) begin
 			if (mem_issue) begin
 				eaf_valid   <= 1'b0;
@@ -328,9 +439,11 @@ always @(posedge clk) begin
 				eaf_is_branch  <= eac_is_branch;
 				eaf_is_scc     <= eac_is_scc;
 				eaf_is_dbcc    <= eac_is_dbcc;
-				eaf_is_jmp     <= 1'b0;   // a mem-source instruction is never also a JMP/BSR/JSR
+				eaf_is_jmp     <= 1'b0;   // a mem-source instruction is never also a JMP/BSR/JSR/TRAP/illegal
 				eaf_is_bsr     <= 1'b0;
 				eaf_is_jsr     <= 1'b0;
+				eaf_is_trap    <= 1'b0;
+				eaf_is_illegal <= 1'b0;
 				eaf_cond       <= eac_cond;
 				mem_pending    <= 1'b0;
 			end else if (wr_stall) begin
@@ -339,6 +452,52 @@ always @(posedge clk) begin
 				// identically next cycle with the SAME push request still
 				// asserted, until the port is free.
 				eaf_valid <= 1'b0;
+			end else if (exc_writing) begin
+				// Posting one beat of the exception frame -- see header.
+				// exc_beat_ack means l1_wr_busy read low THIS cycle, so the
+				// combinational wren_b above is being accepted right now;
+				// advance to the next beat. Otherwise the port's still
+				// busy: hold exc_ph, retry the SAME beat next cycle (eac_*
+				// stays frozen via exc_stall, exactly like wr_stall above).
+				eaf_valid <= 1'b0;
+				if (exc_beat_ack)
+					exc_ph <= (exc_ph == EXC_BEAT0) ? EXC_BEAT1 : EXC_VECRD;
+			end else if (exc_vec_issue) begin
+				// Both frame writes are posted; the vector-table address is
+				// being driven THIS cycle (l1_addr_b, see the combinational
+				// block above) -- l1_q_b registers its data by next cycle,
+				// same one-cycle latency mem_issue/mem_complete already
+				// relies on.
+				eaf_valid       <= 1'b0;
+				exc_vec_pending <= 1'b1;
+			end else if (exc_vec_done) begin
+				// l1_q_b now holds the handler address fetched last cycle.
+				// eaf_operand_a carries it into ap040_execute.v's
+				// ex_recovery_pc exactly like JMP/JSR's redirect target;
+				// eaf_operand_b carries A7's new (post-push) value into the
+				// regfile commit, exactly like BSR/JSR's decrement -- zero
+				// new mux shapes in ap040_execute.v beyond adding these two
+				// flags to existing OR-chains, see its header.
+				eaf_valid      <= eac_valid;
+				eaf_pc         <= eac_pc;
+				eaf_next_pc    <= eac_next_pc;
+				eaf_dest_reg   <= eac_dest_reg;
+				eaf_operand_a  <= l1_q_b;
+				eaf_operand_b  <= exc_new_sp;
+				eaf_alu_op     <= eac_alu_op;
+				eaf_writes_reg <= eac_writes_reg;
+				eaf_writes_ccr <= eac_writes_ccr;
+				eaf_is_branch  <= 1'b0;
+				eaf_is_scc     <= 1'b0;
+				eaf_is_dbcc    <= 1'b0;
+				eaf_is_jmp     <= 1'b0;
+				eaf_is_bsr     <= 1'b0;
+				eaf_is_jsr     <= 1'b0;
+				eaf_is_trap    <= eac_is_trap;
+				eaf_is_illegal <= eac_is_illegal;
+				eaf_cond       <= eac_cond;
+				exc_ph          <= EXC_BEAT0;
+				exc_vec_pending <= 1'b0;
 			end else begin
 				eaf_valid      <= eac_valid;
 				eaf_pc         <= eac_pc;
@@ -364,6 +523,8 @@ always @(posedge clk) begin
 				eaf_is_jmp     <= eac_is_jmp;
 				eaf_is_bsr     <= eac_is_bsr;
 				eaf_is_jsr     <= eac_is_jsr;
+				eaf_is_trap    <= eac_is_trap;
+				eaf_is_illegal <= eac_is_illegal;
 				eaf_cond       <= eac_cond;
 			end
 		end

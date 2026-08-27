@@ -322,3 +322,75 @@ Next: `RTS` -- `(A7)+` into the PC, the natural pop to BSR/JSR's push, and
 the first instruction to actually exercise the write buffer's
 read-after-write forwarding path (built in milestone 12, unreachable by
 anything until now). See `AP040_IMPLEMENTATION_PLAN.md` section 6 item 2.
+
+## 2026-08-27 (later still): milestone 14, exception entry (illegal, TRAP #n)
+
+User: exception handling is next -- check different frame sizes, verify the
+stack data is right, cover the common vector types. Scoped to what the
+current ISA and rtl_old's own (verified, not guessed) exception table
+actually support cleanly: **illegal instruction (vector 4)** and **TRAP #n
+(vectors 32-47)**, both format $0 (4-word frame). Format $2 (address error
+on odd JMP/JSR targets -- real, mode-dependent bit-exact quirks in
+`ap040_core.v`'s S_JMP1/S_JSR1) is split into its own follow-up milestone
+rather than guessed at alongside this one.
+
+- Reuses almost everything BSR/JSR/JMP already built: decode points
+  `id_dest_reg` at A7 for both new vectors (same trick, no new regfile
+  port), the frame's contents are all computed off fields already
+  threaded (`eac_pc`/`eac_next_pc`/`eac_imm`, plus a newly-threaded
+  `ccr_in` for the SR word), and the eventual handler-address redirect
+  reuses `ex_mispredict`/`ex_recovery_pc` exactly like JMP/JSR's
+  unconditional misprediction path.
+- What's genuinely new: `ap040_ea_fetch.v` gained this pipeline's first
+  multi-beat memory operation -- two posted writes (the frame) then a
+  read (the vector table), sequenced by a 3-state register reusing the
+  SAME accept-when-`!l1_wr_busy` retry idiom BSR/JSR's single write
+  already established, one beat at a time.
+- No real VBR register exists (no control registers/MOVEC yet) -- vector
+  fetch treats vector*4 as an ABSOLUTE address fed through the same
+  PC_RESET-relative conversion every other L1 access uses. This works
+  out cleanly, not by luck: PC_RESET has been $400 in every testbench
+  since milestone 1, exactly the byte size of a full 256-entry vector
+  table, so the unsigned address wraparound lands correctly in the same
+  L1 array -- verified arithmetically (Python) before relying on it.
+- Illegal-vs-TRAP PC-field distinction verified against `ap040_core.v`:
+  illegal stacks its OWN address (`go_illegal`'s `spc=pc_i`), TRAP stacks
+  the FOLLOWING instruction's (its dispatch's `spc=pc`) -- a subroutine-
+  call vs. can't-return-past-a-fault distinction, confirmed load-bearing
+  by mutation testing, not assumed from the doc comment.
+- A real semantic change, not just additive: every previously-
+  unrecognized opcode used to be a harmless bubble (`id_unimpl`, never
+  consumed downstream); it's now `id_is_illegal`, a real trap. Confirmed
+  safe by inspection first -- no existing test's program uses an
+  unrecognized opcode.
+- No real RTL bugs surfaced (second milestone in a row with that
+  record -- reusing thoroughly-debugged machinery, not inventing new
+  mechanisms). Test passed on first real compile/run.
+- The test deliberately chains through a real JMP (not just back-to-back
+  like BSR/JSR): the illegal handler marks a register then JMPs back to
+  resume the mainline program at the TRAP instruction, proving the
+  exception's flush/redirect composes correctly with an ordinary,
+  unrelated misprediction recovery right afterward. A7 is not reseeded
+  between the two cases either, so TRAP's push is verified from a
+  different base than the illegal case's.
+- Mutation testing: removing `is_illegal` from A7's dest-reg selection
+  (caught, with an instructive cascade through both frames); flipping
+  illegal's PC-field ternary to TRAP's (caught, cleanly isolated to just
+  the illegal frame); removing `eaf_is_illegal` from `ex_mispredict`
+  while leaving `eaf_is_trap` untouched (caught, confirming illegal's
+  redirect is independently load-bearing). All three restored and
+  diff-confirmed clean. Full detail in `AP040_IMPLEMENTATION_PLAN.md`'s
+  milestone-14 writeup.
+
+Full 16-file `run_pipe_tests.sh` green (14 pipe-core tests + the new
+exception test + the standalone `l1_wbuf` test).
+
+Next: format $2 (address error on odd JMP/JSR targets) -- see
+`AP040_IMPLEMENTATION_PLAN.md` section 6 item 2b for the exact
+`ap040_core.v` call sites and their mode-dependent quirks (JMP's stacked
+PC is `pc_i+2` regardless of gather width; JSR's is the target itself,
+and JSR skips its push entirely on an odd target rather than attempting
+one). After that: `RTS` (see the milestone-13 entry above), TRAPcc, the
+DBcc branch-target parity check, and privilege violation (needs real
+supervisor/user mode -- `sr_s`/`sr_m` are still hardwired) are all queued
+behind this exception-entry machinery now actually existing.

@@ -1,18 +1,49 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 13: BSR, JSR)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 14: exceptions)       //
 //                                                                          //
 // ap040_decode.v - ID stage                                               //
 //                                                                          //
 // Recognizes NOP, MOVEQ, register-direct-to-register-direct MOVE.L,        //
 // register-direct ADD.L Dn,Dm, register-direct Scc.B Dn, DBcc Dn,<label>,  //
 // MOVE.L (An),Dn, MOVE.L (d16,An),Dn, JMP (An), JMP (d16,An), BSR (all      //
-// three displacement widths), JSR (An) and JSR (d16,An), and the whole     //
-// Bcc family including its 16-/32-bit displacement forms (BRA included,    //
-// as its "always true" special case -- see below). Anything else           //
-// classifies as "unimplemented" and rides through the rest of the          //
-// pipeline as a safe bubble (id_writes_reg stays 0) rather than an error;  //
-// a later milestone replaces this with the real instruction-field decode   //
-// extracted from ap040_core.v's S_DECODE.                                  //
+// three displacement widths), JSR (An), JSR (d16,An), TRAP #n, and the      //
+// whole Bcc family including its 16-/32-bit displacement forms (BRA        //
+// included, as its "always true" special case -- see below). Anything      //
+// ELSE is now genuinely ILLEGAL (milestone 14, changed from prior          //
+// milestones): what used to be a harmless bubble (id_writes_reg stays 0,   //
+// nothing downstream ever saw id_unimpl) now raises vector 4 through the   //
+// real exception-entry path -- see id_is_illegal below and                 //
+// ap040_ea_fetch.v's header for the mechanism. A future milestone MAY      //
+// split the 1010/1111-top-nibble opcode classes into their own A-line/     //
+// F-line vectors (10/11) instead of folding them into ILLEGAL -- not done  //
+// here because nothing in this decoder's current scope actually produces   //
+// those top nibbles, so there is no test coverage to verify the split      //
+// against; documented rather than silently wrong.                          //
+//                                                                          //
+// TRAP #n (milestone 14, new): 0100 1110 0100 nnnn (0x4E40-0x4E4F, n =     //
+// vector-32 in the low 4 bits). Single word, no gather, no EA, no operand   //
+// read at all -- the only thing decode contributes beyond recognizing the   //
+// opcode is computing the actual vector NUMBER (32+n) into id_imm, reused    //
+// exactly the way BSR/JMP/JSR already reuse it for a displacement (a          //
+// "general-purpose field", per MOVE.L (d16,An),Dn's header note) rather        //
+// than adding a dedicated port for one 8-bit value. Like BSR/JSR, decode        //
+// points id_dest_reg at A7 (4'd15) and sets id_writes_reg -- TRAP pushes an      //
+// exception frame and decrements A7 exactly like a subroutine call, just         //
+// with the target and frame contents supplied by ap040_ea_fetch.v's new          //
+// exception-entry sequencer instead of a literal branch displacement.             //
+//                                                                          //
+// Illegal instruction (milestone 14, new): id_is_illegal is precisely the   //
+// boolean every opcode-recognition wire above this comment does NOT match    //
+// -- the same expression id_unimpl used to compute, renamed and (for the      //
+// first time) actually threaded downstream, since ap040_ea_fetch.v's           //
+// exception-entry sequencer is now a real consumer, not a future one. Also       //
+// points id_dest_reg at A7/sets id_writes_reg, same shape as TRAP -- an           //
+// illegal-instruction exception pushes a frame and decrements A7 too, per         //
+// ap040_core.v's go_illegal task (format $0, vector 4). The one difference         //
+// from TRAP: the frame's stacked PC is the illegal instruction's OWN address        //
+// (id_pc), not the following instruction's (id_next_pc) -- you can't "return         //
+// past" an illegal opcode the way TRAP's handler returns past the TRAP itself;        //
+// see ap040_ea_fetch.v's header for where that distinction is actually applied.        //
 //                                                                          //
 // BSR (milestone 13, new): the SAME opcode class as Bcc (0110 cccc          //
 // dddddddd), cc==0001, which is_branch_opcode has excluded since milestone  //
@@ -268,8 +299,9 @@ module ap040_decode
 	output reg        id_is_jmp,
 	output reg        id_is_bsr,
 	output reg        id_is_jsr,
-	output reg  [3:0] id_cond,
-	output reg        id_unimpl
+	output reg        id_is_trap,
+	output reg        id_is_illegal,
+	output reg  [3:0] id_cond
 );
 
 assign id_stall = stall_in;
@@ -377,7 +409,23 @@ wire is_jsr_opcode = (if_opcode[15:6] == 10'b0100111010);
 wire is_jsr_an     = is_jsr_opcode && (if_opcode[5:3] == 3'b010);
 wire is_jsr_disp   = is_jsr_opcode && (if_opcode[5:3] == 3'b101);
 
+// TRAP #n: 0100 1110 0100 nnnn (0x4E40-0x4E4F) -- see header. Distinct
+// if_opcode[15:6] value (10'b0100111001) from both JSR's (...010) and JMP's
+// (...011), so no overlap is possible with either.
+wire is_trap = (if_opcode[15:4] == 12'h4E4);
+
 wire is_nop = (if_opcode == `AP040_OP_NOP);
+
+// Illegal instruction: precisely what none of the above (nor NOP/MOVEQ/
+// MOVE.L/ADD.L/Bcc/Scc below) recognizes. Computed once here, as a single
+// wire, rather than repeating the same ten-term negation at both id_unimpl's
+// old two use sites (the gather-completion branch, which is never illegal by
+// construction, and the single-word final-else branch, which is the only
+// place this actually varies) -- see header for why this now drives a real
+// exception instead of a silent bubble.
+wire is_illegal = !is_nop && !is_moveq && !is_move_rr && !is_add_rr &&
+                   !is_branch_byte && !is_scc_rr && !is_move_mem_l &&
+                   !is_jmp_an && !is_bsr_byte && !is_jsr_an && !is_trap;
 
 // Gather state -- see header comment. 0 = idle/normal decode cycle;
 // 1 = this cycle's if_opcode completes the gather; 2 = one more word
@@ -455,8 +503,9 @@ always @(posedge clk) begin
 		id_is_jmp       <= 1'b0;
 		id_is_bsr       <= 1'b0;
 		id_is_jsr       <= 1'b0;
+		id_is_trap      <= 1'b0;
+		id_is_illegal   <= 1'b0;
 		id_cond         <= 4'h0;
-		id_unimpl       <= 1'b0;
 		ext_pending     <= 2'd0;
 		held_is_long    <= 1'b0;
 		held_is_dbcc    <= 1'b0;
@@ -515,8 +564,9 @@ always @(posedge clk) begin
 					id_is_jmp       <= held_is_jmp;
 					id_is_bsr       <= held_is_bsr;
 					id_is_jsr       <= held_is_jsr;
+					id_is_trap      <= 1'b0;
+					id_is_illegal   <= 1'b0;
 					id_cond         <= held_cond;
-					id_unimpl       <= 1'b0;
 					ext_pending     <= 2'd0;
 				end else begin
 					id_valid    <= 1'b0;
@@ -546,7 +596,7 @@ always @(posedge clk) begin
 				id_pc           <= if_pc;
 				id_next_pc      <= if_pc + 32'd2;
 				id_dest_reg     <= is_scc_rr ? {1'b0, d_rn} :
-				                    (is_bsr_byte || is_jsr_an) ? 4'd15 : {1'b0, d_reg9};
+				                    (is_bsr_byte || is_jsr_an || is_trap || is_illegal) ? 4'd15 : {1'b0, d_reg9};
 				// is_move_mem_l/is_jmp_an/is_jsr_an's src_reg is An, not Dn
 				// -- the unified index's top bit (8+n vs 0+n) is the ONLY
 				// thing that distinguishes "read this register's value as
@@ -556,17 +606,24 @@ always @(posedge clk) begin
 				// EX-forward) doesn't need to know the difference, it just
 				// resolves whichever register this is. BSR.B needs no
 				// source read at all (see the gather-completion note
-				// above), so it's simply absent from this OR-chain.
+				// above), so it's simply absent from this OR-chain. TRAP/
+				// illegal need no source read either -- same reasoning as
+				// BSR.
 				id_src_reg      <= (is_move_mem_l || is_jmp_an || is_jsr_an) ? {1'b1, d_rn} : {1'b0, d_rn};
 				// Zeroed for is_move_mem_l/is_jmp_an/is_jsr_an (was the
 				// sign-extended opcode low byte for EVERY instruction here,
 				// harmless until ap040_ea_fetch.v started adding eac_imm to
 				// the address for memory-source instructions -- see
-				// header). Still meaningful for MOVEQ.
-				id_imm          <= (is_move_mem_l || is_jmp_an || is_jsr_an) ? 32'h0 : {{24{if_opcode[7]}}, if_opcode[7:0]};
+				// header). Still meaningful for MOVEQ. TRAP repurposes this
+				// same general-purpose field for its actual vector NUMBER
+				// (32+n, not just n -- ap040_ea_fetch.v consumes it as-is,
+				// no +32 needed downstream) -- see header.
+				id_imm          <= (is_move_mem_l || is_jmp_an || is_jsr_an) ? 32'h0 :
+				                    is_trap ? (32'd32 + {28'd0, if_opcode[3:0]}) :
+				                              {{24{if_opcode[7]}}, if_opcode[7:0]};
 				id_alu_op       <= is_add_rr ? `AP040_ALU_ADD : `AP040_ALU_MOVE;
 				id_src_a_is_imm <= if_valid && is_moveq;
-				id_writes_reg   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_scc_rr || is_move_mem_l || is_bsr_byte || is_jsr_an);
+				id_writes_reg   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_scc_rr || is_move_mem_l || is_bsr_byte || is_jsr_an || is_trap || is_illegal);
 				id_writes_ccr   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_move_mem_l);
 				id_is_branch    <= if_valid && is_branch_byte;
 				id_is_scc       <= if_valid && is_scc_rr;
@@ -575,8 +632,9 @@ always @(posedge clk) begin
 				id_is_jmp       <= if_valid && is_jmp_an;
 				id_is_bsr       <= if_valid && is_bsr_byte;
 				id_is_jsr       <= if_valid && is_jsr_an;
+				id_is_trap      <= if_valid && is_trap;
+				id_is_illegal   <= if_valid && is_illegal;
 				id_cond         <= if_opcode[11:8];
-				id_unimpl       <= if_valid && !is_nop && !is_moveq && !is_move_rr && !is_add_rr && !is_branch_byte && !is_scc_rr && !is_move_mem_l && !is_jmp_an && !is_bsr_byte && !is_jsr_an;
 			end
 		end
 	end

@@ -101,6 +101,7 @@ Completed milestones (`tb/run_pipe_tests.sh`, one file per milestone):
 | 11 | JMP (An), JMP (d16,An) -- EA-computed PC redirect, reusing EX's mispredict/recovery mechanism unconditionally | `tb_ap040_pipe_jmp.v` |
 | 12 | `ap040_pipe_l1.v` posted write buffer (port B write side, ahead of BSR/JSR) | `tb_ap040_pipe_l1_wbuf.v` |
 | 13 | BSR (all 3 widths), JSR (An)/(d16,An) -- first real stack push, reusing the write buffer | `tb_ap040_pipe_bsr.v`, `tb_ap040_pipe_jsr.v` |
+| 14 | Exception entry: illegal instruction (vector 4), TRAP #n (vectors 32-47), format $0 (4-word) frame -- first exception-entry sequencer | `tb_ap040_pipe_exc.v` |
 
 Register-direct/immediate/register-indirect(+displacement) only -- no
 indexed/absolute/PC-relative EA modes, no byte/word sizes yet (BSR/JSR now
@@ -482,6 +483,110 @@ is genuinely new logic.
 Full 15-file `run_pipe_tests.sh` green (13 pipe-core tests + BSR + JSR +
 the standalone `l1_wbuf` test).
 
+**DONE (milestone 14, 2026-08-27): exception entry -- illegal instruction
+(vector 4), TRAP #n (vectors 32-47), format $0 (4-word, 8-byte) frame
+only.** The user's framing for this milestone: "also jump related but
+with more writes" -- accurate in hindsight, since it reuses almost every
+mechanism BSR/JSR/JMP already built, just with more of them at once.
+Format $2 (address error on an odd JMP/JSR target -- the two vectors
+`rtl_old` has real, mode-dependent bit-exact quirks for) is deliberately
+its own follow-up milestone, not guessed at here -- see section 6 item 2b.
+
+- **What changed semantically, not just additively**: every opcode this
+  decoder doesn't recognize used to ride through as a harmless bubble
+  (`id_writes_reg` stays 0, nothing downstream ever consumed `id_unimpl`).
+  That bit is now `id_is_illegal`, threaded all the way to a real
+  exception. No existing test's program uses an unrecognized opcode
+  (confirmed by inspection before relying on it -- none start with the
+  0xA/0xF top nibble either, so the still-deferred A-line/F-line split
+  has no coverage gap to hide), so this was a safe rename-and-wire, not a
+  risky one, but it IS a real behavior change worth flagging plainly.
+- **Vector fetch has no real VBR.** This substrate has no control
+  registers at all yet (no MOVEC), so vector*4 is used as an ABSOLUTE
+  address, fed through the exact same `address - PC_RESET) >> 1`
+  conversion every other L1 access already uses -- not a special case.
+  This works out cleanly rather than by luck: `PC_RESET` has been `$400`
+  in every testbench since milestone 1, which happens to be exactly the
+  byte size of a full 256-entry 68k vector table, so the unsigned
+  wraparound in that subtraction lands a low vector number in the
+  mathematically-correct modular slot of the SAME `ap040_pipe_l1.v`
+  array, verified arithmetically (Python, mirroring Verilog's 32-bit
+  wraparound then 12-bit truncation) before relying on it, not assumed.
+  New test programs need to keep their real code and vector-table pokes
+  out of each other's word-index ranges -- worth remembering for any
+  future exception test.
+- **The exception-entry sequencer lives in `ap040_ea_fetch.v`**, this
+  pipeline's first multi-beat memory operation: two posted writes (the
+  frame, reusing milestone 12's write buffer exactly like BSR/JSR's
+  single write already did, just twice) followed by a plain read (the
+  vector table, reusing the SAME `mem_issue`/`mem_complete` one-cycle-
+  latency shape MOVE.L's read already established). A 3-state register
+  (`exc_ph`: BEAT0/BEAT1/VECRD) sequences them one at a time; each beat
+  independently reuses the accept-when-`!l1_wr_busy` retry idiom BSR/
+  JSR's `wr_stall` already established, not a new handshake shape.
+- **No new regfile port, no new forwarding mux, again.** Decode points
+  `id_dest_reg` at A7 for both illegal and TRAP, exactly like BSR/JSR --
+  `operand_b` (port B) resolves A7's current, correctly-forwarded value
+  for free, and the frame's SR/PC/format-vector words are all computed
+  combinationally off already-available fields (`eac_pc`/`eac_next_pc`/
+  `eac_imm`/a newly-threaded `ccr_in`) every cycle of the sequence, not
+  latched once -- safe because `eac_*` is frozen by the sequence's own
+  stall the whole time anyway, so a latch would just be a redundant copy.
+- **The illegal-vs-TRAP PC-field distinction is real and load-bearing,
+  not a stylistic choice**: illegal instruction stacks its OWN address
+  (`eac_pc` -- you can't "return past" an illegal opcode), TRAP stacks
+  the FOLLOWING instruction's address (`eac_next_pc` -- TRAP is
+  architecturally a subroutine call). Verified against `ap040_core.v`'s
+  `go_illegal` (`spc=pc_i`) vs. its TRAP dispatch (`spc=pc`) -- confirmed
+  by mutation-testing this exact ternary (see below), not assumed from
+  the doc comment alone.
+- **SR word is synthesized, not read from a real register**: this
+  pipeline has no T1/T0/M/IPL state at all yet (`sr_s`/`sr_m` are still
+  hardwired in `ap040_pipe_core.v`), so the system byte is a fixed
+  `8'b0010_0000` (S=1, everything else 0, matching `AP040_SR_RESET`'s
+  S=1/M=0 but omitting its IPL=111 reset default -- a known, documented
+  simplification) with the real, live `ccr_in` (write-through forwarded,
+  same source `ap040_execute.v`'s Bcc/Scc condition check already uses)
+  supplying the low byte.
+- **No real RTL bugs surfaced this milestone** -- the second milestone in
+  a row with that track record (see milestone 13's writeup), again
+  attributed to reusing thoroughly-debugged machinery (the write buffer,
+  the mem_issue/mem_complete read shape, the operand_b-as-A7 trick)
+  rather than inventing new mechanisms from scratch. The testbench passed
+  on its first real compile/run, including the exact frame word values
+  computed by hand/script beforehand.
+- **The test deliberately chains through a real JMP, not just
+  back-to-back like BSR/JSR's two cases**: the illegal handler executes
+  `MOVEQ #7,D2` (marker) then `JMP (A2)` to resume the mainline program at
+  the TRAP instruction, proving the exception's flush/redirect composes
+  correctly with an ORDINARY, unrelated misprediction recovery
+  immediately afterward -- not just that the exception mechanism fires in
+  isolation. A7 is also deliberately NOT reseeded between the illegal and
+  TRAP cases, so TRAP's frame push is verified from a different base than
+  $600, the same "chain through the same register" property BSR's two
+  cases already established.
+- **Mutation testing**: removing `is_illegal` from `id_dest_reg`'s A7
+  selection -- caught, with an instructive cascade (the illegal push
+  silently wrote through D0 instead of A7, using D0's untouched value of
+  0 as a "stack pointer," landing the frame at a wildly different array
+  index; A7 itself never moved, so the SUBSEQUENT TRAP's push then landed
+  exactly where the test expected the ILLEGAL frame to be, and the real
+  illegal frame's contents were nowhere the test looked -- a clean
+  demonstration of why this field matters, not just that it does).
+  Flipping illegal's PC-field ternary to also use `eac_next_pc` (matching
+  TRAP's) -- caught, and cleanly isolated: only the illegal frame's PC
+  word broke, TRAP's stayed correct, confirming the two vectors' PC-field
+  semantics are independently exercised, not accidentally coupled.
+  Removing `eaf_is_illegal` (only) from `ex_mispredict`'s OR-chain,
+  leaving `eaf_is_trap` untouched -- caught (the poison after the illegal
+  instruction ran, its handler never did), while TRAP's own case B stayed
+  fully passing throughout, confirming illegal's redirect is independently
+  load-bearing rather than incidentally covered by TRAP's own working path.
+  All three restored and diff-confirmed clean.
+
+Full 16-file `run_pipe_tests.sh` green (14 pipe-core tests + the new
+exception test + the standalone `l1_wbuf` test).
+
 ## 5. Verification discipline (keep doing this)
 
 This is what has actually kept the pipeline correct across twelve milestones
@@ -561,23 +666,37 @@ of rewrites; don't relax it for speed:
    test pop symmetry against, and the first instruction to actually
    exercise the write buffer's read-after-write forwarding path (built
    in milestone 12, never yet reachable by any implemented instruction).
-2b. **DBcc's deferred odd-target address-error** and **TRAPcc** both need
-   the next item before they can be finished, not before they can be
-   started -- see their notes in `ap040_execute.v`/`AP040_IMPLEMENTATION_PLAN.md`
-   history for why a partial version was rejected rather than built.
-3. **Illegal-instruction / exception delivery.** Vector fetch + supervisor
-   stack frame push (format `$0`/`$1`/`$2` to start). This is the
-   prerequisite for TRAPcc, the DBcc branch-target parity check, address
-   error, and privilege violation -- all currently deferred specifically
-   because there's nowhere to deliver the fault yet.
-4. **Byte/word-sized ALU ops and MOVE** (current pipeline is Long-only
+2b. **DONE (milestone 14): illegal-instruction / exception delivery**,
+   format $0 (4-word frame) only -- vector fetch (`VBR` conceptually
+   equals `PC_RESET`, no real control register yet) + supervisor stack
+   frame push, for vector 4 (illegal instruction -- what used to be a
+   silent bubble now genuinely traps) and TRAP #n (vectors 32-47, new
+   opcode). See the writeup above section 5. **Still NOT done**: format
+   $2 (the 6-word frame, one extra "instruction address" longword) for
+   **address error on an odd JMP/JSR target** -- `rtl_old`'s S_JMP1/S_JSR1
+   have real, mode-dependent bit-exact quirks (JMP's stacked PC is
+   `pc_i+2` regardless of gather width; JSR's is the target itself, and
+   JSR skips its push entirely rather than attempting one at an odd
+   address) verified against `ap040_core.v` but not yet built here --
+   deliberately split into its own milestone rather than guessed at
+   alongside format $0. Also still deferred: **TRAPcc**, **DBcc's
+   branch-target parity check**, **privilege violation** (needs real
+   supervisor/user mode -- `sr_s`/`sr_m` are still hardwired), **CHK**/
+   **zero-divide** (no such instructions exist yet), **trace**, **RTE**
+   (the return path -- everything above is entry-only so far, verified by
+   reading pushed frame contents directly out of `ap040_pipe_l1.v`'s
+   array, the same style BSR/JSR's own tests already use, not by actually
+   returning), and **bus/access-fault format $7** (needs a real BCU/MMU,
+   explicitly deferred with that milestone per section 5's write-buffer
+   note).
+3. **Byte/word-sized ALU ops and MOVE** (current pipeline is Long-only
    throughout `ap040_pipe_alu.v`'s size port is already there and unused).
-5. **MMU and cache integration**, once enough of the integer ISA exists that
+4. **MMU and cache integration**, once enough of the integer ISA exists that
    testing them against real address translation is meaningful. Reuse the
    architectural requirements from `rtl_old/ap040_mmu.v`/`ap040_cache.v`
    directly -- don't re-derive the 040 table-walk/ATC/TTR rules from the
    manual a second time.
-6. **FPU integration**, gated on the above the same way `rtl_old` staged it
+5. **FPU integration**, gated on the above the same way `rtl_old` staged it
    (LC040 trap-only mode before any hardware arithmetic).
 7. **Superscalar/dual-issue** is an explicit stretch goal, not a
    prerequisite for anything above -- 68060-class pairing rules, do it last,
