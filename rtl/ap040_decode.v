@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 14: exceptions)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 15: supervisor state)       //
 //                                                                          //
 // ap040_decode.v - ID stage                                               //
 //                                                                          //
@@ -301,6 +301,8 @@ module ap040_decode
 	output reg        id_is_jsr,
 	output reg        id_is_trap,
 	output reg        id_is_illegal,
+	output reg        id_is_movesr,
+	output reg        id_is_movec,
 	output reg  [3:0] id_cond
 );
 
@@ -414,6 +416,46 @@ wire is_jsr_disp   = is_jsr_opcode && (if_opcode[5:3] == 3'b101);
 // (...011), so no overlap is possible with either.
 wire is_trap = (if_opcode[15:4] == 12'h4E4);
 
+// MOVE to SR, register-direct source only: 0100 0110 11 000 rrr
+// (0x46C0-0x46C7) -- see header. Privileged; the actual privilege check is
+// DYNAMIC (this stage has no visibility into the live S bit), so it happens
+// in ap040_ea_fetch.v against the forwarded SR -- see its header. bits[15:6]
+// (10'b0100011011) share no prefix with JMP's/JSR's/TRAP's own 0x4Exx
+// ranges, so no collision is possible with any of them.
+wire is_movesr = (if_opcode[15:6] == 10'b0100011011) && (if_opcode[5:3] == 3'b000);
+
+// MOVEC Rc,Rn / MOVEC Rn,Rc: 0100 1110 0111 101d (0x4E7A read-direction,
+// 0x4E7B write-direction, d = if_opcode[0]) -- verified against
+// ap040_core.v's own S_MOVEC1/S_MOVEC2 dispatch (`ir[0]` selects mvc_dir the
+// same way). Always carries exactly one 16-bit extension word (the
+// register/selector field), routed through the shared gather state machine
+// below like every other word-form instruction -- see header.
+wire is_movec_opcode = (if_opcode[15:1] == 15'b010011100111101);
+
+// MOVEC's extension-word fields -- meaningful only during the gather-
+// completion cycle (if_opcode holds the extension word by then, not the
+// original opcode), harmless otherwise, same "compute always" precedent as
+// gather_disp below. Selector validity restricted to what this core
+// actually models this milestone (SFC/DFC/CACR/VBR/USP/ISP/MSP) -- every
+// other real MOVEC target (TC/ITT0/ITT1/DTT0/DTT1/URP/SRP/MMUSR) is MMU
+// state, explicitly out of scope per the user's own framing ("don't need to
+// worry about MMU registers yet"); an otherwise-valid MOVEC naming one of
+// those is treated as illegal (vector 4), matching ap040_core.v's own
+// movec_valid() gate on go_illegal, not silently accepted or dropped.
+wire [11:0] movec_raw_sel = if_opcode[11:0];
+wire        movec_sel_valid = (movec_raw_sel == 12'h000) || (movec_raw_sel == 12'h001) ||
+                               (movec_raw_sel == 12'h002) || (movec_raw_sel == 12'h801) ||
+                               (movec_raw_sel == 12'h800) || (movec_raw_sel == 12'h804) ||
+                               (movec_raw_sel == 12'h803);
+wire  [2:0] movec_sel_code = (movec_raw_sel == 12'h000) ? `AP040_CREG_SFC  :
+                              (movec_raw_sel == 12'h001) ? `AP040_CREG_DFC  :
+                              (movec_raw_sel == 12'h002) ? `AP040_CREG_CACR :
+                              (movec_raw_sel == 12'h801) ? `AP040_CREG_VBR  :
+                              (movec_raw_sel == 12'h800) ? `AP040_CREG_USP  :
+                              (movec_raw_sel == 12'h804) ? `AP040_CREG_ISP  :
+                                                            `AP040_CREG_MSP;  // 12'h803
+wire  [3:0] movec_gpr = {if_opcode[15], if_opcode[14:12]};
+
 wire is_nop = (if_opcode == `AP040_OP_NOP);
 
 // Illegal instruction: precisely what none of the above (nor NOP/MOVEQ/
@@ -422,10 +464,15 @@ wire is_nop = (if_opcode == `AP040_OP_NOP);
 // old two use sites (the gather-completion branch, which is never illegal by
 // construction, and the single-word final-else branch, which is the only
 // place this actually varies) -- see header for why this now drives a real
-// exception instead of a silent bubble.
+// exception instead of a silent bubble. is_movec_opcode is excluded for
+// documentation clarity, not correctness -- it always routes into the
+// gather-start branch instead, so this wire is never actually consulted for
+// it, but an invalid MOVEC selector DOES become illegal, one level down
+// (movec_illegal_gather below), once the extension word is known.
 wire is_illegal = !is_nop && !is_moveq && !is_move_rr && !is_add_rr &&
                    !is_branch_byte && !is_scc_rr && !is_move_mem_l &&
-                   !is_jmp_an && !is_bsr_byte && !is_jsr_an && !is_trap;
+                   !is_jmp_an && !is_bsr_byte && !is_jsr_an && !is_trap &&
+                   !is_movesr && !is_movec_opcode;
 
 // Gather state -- see header comment. 0 = idle/normal decode cycle;
 // 1 = this cycle's if_opcode completes the gather; 2 = one more word
@@ -444,6 +491,14 @@ wire is_illegal = !is_nop && !is_moveq && !is_move_rr && !is_add_rr &&
 // JSR (d16,An) needs held_reg (An), same as JMP's gather, but always
 // writes A7 (4'd15) rather than reading held_dest_reg the way move-disp's
 // Dn destination does.
+// held_is_movec (milestone 15) adds a seventh kind: MOVEC's gather needs no
+// held_reg at all (the extension word carries BOTH the register selector
+// AND the general-register field itself -- see movec_gpr/movec_sel_code
+// above, read directly off if_opcode at gather completion, not shifted into
+// disp_acc). It needs one thing nothing else does: the DIRECTION bit,
+// which lives in the ORIGINAL opcode word (if_opcode[0], read/write), not
+// the extension word -- captured into held_movec_dir at gather START,
+// before if_opcode stops meaning the opcode at all.
 reg  [1:0]  ext_pending;
 reg         held_is_long;
 reg         held_is_dbcc;
@@ -451,6 +506,8 @@ reg         held_is_move_disp;
 reg         held_is_jmp;
 reg         held_is_bsr;
 reg         held_is_jsr;
+reg         held_is_movec;
+reg         held_movec_dir;
 reg  [2:0]  held_reg;
 reg  [2:0]  held_dest_reg;
 reg  [31:0] held_pc;
@@ -477,7 +534,15 @@ wire [31:0] gather_disp = held_is_long ? {disp_acc[15:0], if_opcode}
 // excluded here -- unconditionally taken, same as BRA, so the "assume
 // taken" guess is always correct -- see this file's header.
 wire redirect_from_byte   = if_valid && (is_branch_byte || is_bsr_byte) && (ext_pending == 2'd0);
-wire redirect_from_gather = completing_gather && !held_is_move_disp && !held_is_jmp && !held_is_jsr;
+wire redirect_from_gather = completing_gather && !held_is_move_disp && !held_is_jmp &&
+                             !held_is_jsr && !held_is_movec;
+
+// MOVEC gather-completion helper: an otherwise-recognized MOVEC whose
+// extension-word selector names something this core doesn't model (the MMU
+// registers, out of scope -- see movec_sel_valid's own comment) becomes
+// illegal, exactly the same vector/format id_is_illegal already drives for
+// any other unrecognized opcode.
+wire movec_illegal_gather = held_is_movec && !movec_sel_valid;
 
 assign id_redirect_valid = redirect_from_byte || redirect_from_gather;
 assign id_redirect_pc    = redirect_from_gather
@@ -505,6 +570,8 @@ always @(posedge clk) begin
 		id_is_jsr       <= 1'b0;
 		id_is_trap      <= 1'b0;
 		id_is_illegal   <= 1'b0;
+		id_is_movesr    <= 1'b0;
+		id_is_movec     <= 1'b0;
 		id_cond         <= 4'h0;
 		ext_pending     <= 2'd0;
 		held_is_long    <= 1'b0;
@@ -513,6 +580,8 @@ always @(posedge clk) begin
 		held_is_jmp     <= 1'b0;
 		held_is_bsr     <= 1'b0;
 		held_is_jsr     <= 1'b0;
+		held_is_movec   <= 1'b0;
+		held_movec_dir  <= 1'b0;
 		held_reg        <= 3'h0;
 		held_dest_reg   <= 3'h0;
 		held_pc         <= 32'h0;
@@ -530,17 +599,33 @@ always @(posedge clk) begin
 				if (completing_gather) begin
 					id_valid        <= 1'b1;
 					id_pc           <= held_pc;
+					// Unconditional regardless of movec_illegal_gather: this
+					// is genuinely "the next instruction's address" -- the
+					// extension word was consumed either way, so the gather
+					// is the same width whether or not its selector turned
+					// out valid. id_is_illegal's own exception path reads
+					// id_pc (held_pc, already set above), not id_next_pc, for
+					// its stacked PC -- see ap040_ea_fetch.v's header.
 					id_next_pc      <= held_pc + 32'd2 + (held_is_long ? 32'd4 : 32'd2);
 					id_dest_reg     <= held_is_dbcc ? {1'b0, held_reg} :
 					                    held_is_move_disp ? {1'b0, held_dest_reg} :
-					                    (held_is_bsr || held_is_jsr) ? 4'd15 : 4'h0;
+					                    (held_is_bsr || held_is_jsr) ? 4'd15 :
+					                    held_is_movec ? (held_movec_dir ? 4'd15 : movec_gpr) : 4'h0;
 					// move-disp and JMP/JSR-disp all read An as their EA base
 					// (held_reg, unified index 8+n); DBcc's held_reg means
 					// its loop counter instead; BSR needs no source read at
 					// all (its target came from decode's own redirect_pc,
 					// not a register), so held_reg is simply unused for it.
+					// MOVEC's write direction (Rn -> control register) reads
+					// Rn as its source, same as any other register-direct
+					// source operand; its read direction needs no source
+					// read at all (the "operand" is a control register,
+					// resolved entirely in ap040_ea_fetch.v/ap040_execute.v
+					// -- see their headers), so movec_gpr only appears here
+					// for the write-direction half.
 					id_src_reg      <= held_is_dbcc ? {1'b0, held_reg} :
-					                    (held_is_move_disp || held_is_jmp || held_is_jsr) ? {1'b1, held_reg} : 4'h0;
+					                    (held_is_move_disp || held_is_jmp || held_is_jsr) ? {1'b1, held_reg} :
+					                    (held_is_movec && held_movec_dir) ? movec_gpr : 4'h0;
 					// gather_disp is already the sign-extended displacement
 					// word (same wire Bcc/DBcc use for their target math) --
 					// move-disp and JMP/JSR-disp all reuse it verbatim as
@@ -548,16 +633,31 @@ always @(posedge clk) begin
 					// kind, matching the plain-(An)/JMP(An)/JSR(An) id_imm
 					// fix below (this field is a real address offset now,
 					// not just MOVEQ's unused-elsewhere immediate -- see
-					// header).
-					id_imm          <= (held_is_move_disp || held_is_jmp || held_is_jsr) ? gather_disp : 32'h0;
+					// header). MOVEC repurposes it once more (same
+					// "general-purpose field" precedent TRAP's vector number
+					// already established) to carry {direction, selector
+					// code} packed together -- ap040_ea_fetch.v/
+					// ap040_execute.v extract both from eac_imm[3:0] rather
+					// than needing two more dedicated ports threaded through
+					// every stage.
+					id_imm          <= (held_is_move_disp || held_is_jmp || held_is_jsr) ? gather_disp :
+					                    held_is_movec ? {28'd0, held_movec_dir, movec_sel_code} : 32'h0;
 					id_alu_op       <= `AP040_ALU_MOVE;
 					id_src_a_is_imm <= 1'b0;
 					// DBcc's write is dynamic (see header); BSR/JSR's is
 					// static -- both always decrement A7 when they execute
-					// at all.
-					id_writes_reg   <= held_is_move_disp || held_is_bsr || held_is_jsr;
+					// at all. MOVEC's read direction writes a real GPR
+					// (Rn <- the selected control register); its write
+					// direction writes no GPR at all (the control register
+					// write happens via ap040_execute.v's new exe_writes_
+					// creg path, not commit_reg) -- and an invalid selector
+					// writes nothing either, having already become illegal
+					// above.
+					id_writes_reg   <= held_is_move_disp || held_is_bsr || held_is_jsr ||
+					                    (held_is_movec && !held_movec_dir && !movec_illegal_gather);
 					id_writes_ccr   <= held_is_move_disp;
-					id_is_branch    <= !held_is_dbcc && !held_is_move_disp && !held_is_jmp && !held_is_bsr && !held_is_jsr;
+					id_is_branch    <= !held_is_dbcc && !held_is_move_disp && !held_is_jmp &&
+					                    !held_is_bsr && !held_is_jsr && !held_is_movec;
 					id_is_scc       <= 1'b0;
 					id_is_dbcc      <= held_is_dbcc;
 					id_is_mem_src   <= held_is_move_disp;
@@ -565,7 +665,9 @@ always @(posedge clk) begin
 					id_is_bsr       <= held_is_bsr;
 					id_is_jsr       <= held_is_jsr;
 					id_is_trap      <= 1'b0;
-					id_is_illegal   <= 1'b0;
+					id_is_illegal   <= movec_illegal_gather;
+					id_is_movesr    <= 1'b0;
+					id_is_movec     <= held_is_movec && !movec_illegal_gather;
 					id_cond         <= held_cond;
 					ext_pending     <= 2'd0;
 				end else begin
@@ -573,12 +675,12 @@ always @(posedge clk) begin
 					ext_pending <= ext_pending - 2'd1;
 				end
 			end else if (is_branch_word || is_branch_long || is_dbcc || is_move_disp || is_jmp_disp ||
-			              is_bsr_word || is_bsr_long || is_jsr_disp) begin
+			              is_bsr_word || is_bsr_long || is_jsr_disp || is_movec_opcode) begin
 				// Opcode word of a word/long-form branch, a DBcc,
-				// MOVE.L (d16,An),Dn, JMP (d16,An), a word/long-form BSR, or
-				// JSR (d16,An) (all word-form except long-branch/long-BSR):
-				// not a complete instruction yet -- hold what we know, start
-				// gathering.
+				// MOVE.L (d16,An),Dn, JMP (d16,An), a word/long-form BSR,
+				// JSR (d16,An), or MOVEC (all word-form except long-branch/
+				// long-BSR): not a complete instruction yet -- hold what we
+				// know, start gathering.
 				id_valid      <= 1'b0;
 				held_pc       <= if_pc;
 				held_cond     <= if_opcode[11:8];
@@ -588,6 +690,10 @@ always @(posedge clk) begin
 				held_is_jmp   <= is_jmp_disp;
 				held_is_bsr   <= is_bsr_word || is_bsr_long;
 				held_is_jsr   <= is_jsr_disp;
+				held_is_movec <= is_movec_opcode;
+				held_movec_dir<= if_opcode[0];   // MOVEC's direction bit lives
+				                                  // in the OPCODE word, not the
+				                                  // extension word -- see header.
 				held_reg      <= if_opcode[2:0];
 				held_dest_reg <= if_opcode[11:9];
 				ext_pending   <= (is_branch_long || is_bsr_long) ? 2'd2 : 2'd1;
@@ -596,7 +702,7 @@ always @(posedge clk) begin
 				id_pc           <= if_pc;
 				id_next_pc      <= if_pc + 32'd2;
 				id_dest_reg     <= is_scc_rr ? {1'b0, d_rn} :
-				                    (is_bsr_byte || is_jsr_an || is_trap || is_illegal) ? 4'd15 : {1'b0, d_reg9};
+				                    (is_bsr_byte || is_jsr_an || is_trap || is_illegal || is_movesr) ? 4'd15 : {1'b0, d_reg9};
 				// is_move_mem_l/is_jmp_an/is_jsr_an's src_reg is An, not Dn
 				// -- the unified index's top bit (8+n vs 0+n) is the ONLY
 				// thing that distinguishes "read this register's value as
@@ -634,6 +740,8 @@ always @(posedge clk) begin
 				id_is_jsr       <= if_valid && is_jsr_an;
 				id_is_trap      <= if_valid && is_trap;
 				id_is_illegal   <= if_valid && is_illegal;
+				id_is_movesr    <= if_valid && is_movesr;
+				id_is_movec     <= 1'b0;   // MOVEC never reaches this branch -- it always gathers
 				id_cond         <= if_opcode[11:8];
 			end
 		end

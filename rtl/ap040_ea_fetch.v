@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 14: exceptions)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 15: supervisor state)       //
 //                                                                          //
 // ap040_ea_fetch.v - EA-fetch stage                                       //
 //                                                                          //
@@ -187,17 +187,40 @@
 //   Format/vector-offset word: {format(4)=0, 00, vector(8), 00} -- vector*4 falls               //
 //             naturally out of this bit placement, no explicit shift needed.                     //
 //                                                                            //
-// Vector fetch: this substrate has no real VBR register (no MOVEC, no control        //
-// registers at all yet) and, unlike a real 68040, no separate low-memory region       //
-// distinct from ap040_pipe_l1.v's PC_RESET-relative window -- vector*4 is used         //
-// as an ABSOLUTE address, fed through the exact SAME `l1_addr_word - PC_RESET) >>       //
-// 1` conversion every other address on this port already goes through. This is          //
-// not a special case: PC_RESET's own value (0x400 in every testbench so far,             //
-// deliberately -- exactly the byte size of a full 256-entry 68k vector table) was          //
-// already chosen with headroom for the vector table to occupy the address range              //
-// BELOW it, and the unsigned wraparound in that subtraction lands vector*4 in the              //
-// mathematically-correct modular slot of the SAME L1 array with zero new address               //
-// logic -- confirmed arithmetically, not assumed, before relying on it.                          //
+// Vector fetch: this substrate has NO real VBR register consulted here (see              //
+// milestone 15 below -- one now EXISTS in ap040_pipe_core.v, but this pipeline's           //
+// only two implemented vectors are both low, fixed numbers, so nothing here has             //
+// needed to add it in yet) and, unlike a real 68040, no separate low-memory region           //
+// distinct from ap040_pipe_l1.v's PC_RESET-relative window -- vector*4 is used                //
+// as an ABSOLUTE address, fed through the exact SAME `l1_addr_word - PC_RESET) >>              //
+// 1` conversion every other address on this port already goes through. This is                 //
+// not a special case: PC_RESET's own value (0x400 in every testbench so far,                    //
+// deliberately -- exactly the byte size of a full 256-entry 68k vector table) was                 //
+// already chosen with headroom for the vector table to occupy the address range                    //
+// BELOW it, and the unsigned wraparound in that subtraction lands vector*4 in the                    //
+// mathematically-correct modular slot of the SAME L1 array with zero new address                     //
+// logic -- confirmed arithmetically, not assumed, before relying on it.                                //
+//                                                                                          //
+// MOVE to SR / MOVEC / privilege violation (milestone 15, new): the first DYNAMIC          //
+// exception trigger. Illegal/TRAP are decode-time facts; whether a privileged             //
+// opcode actually FAULTS depends on the LIVE S bit (sr_in[13]) -- eac_is_priv is           //
+// computed right here, the earliest point that value exists, and folds straight            //
+// into eac_is_exc/exc_pc_field/exc_vec_num alongside illegal/TRAP (own address,            //
+// vector 8, format $0 -- go_priv's exact convention). The frame push itself uses            //
+// isp_in/msp_in DIRECTLY, never port B/A7 (see exc_sp_bank below for why: a fault             //
+// taken WHILE ALREADY IN USER MODE must still land its frame on a SUPERVISOR                  //
+// stack, not USP) -- which also means MOVEC's READ direction pointing port B at                //
+// its intended GPR destination for the NORMAL case is fine as-is, no rerouting                  //
+// needed there at all. eaf_dest_reg IS still overridden on the COMMIT side once                  //
+// exc_vec_done finalizes (A7, not Rn, is what the exception's OWN result writes),                 //
+// since that's a genuinely different register than whatever the now-suppressed                    //
+// original instruction intended. MOVE-to-SR and MOVEC's WRITE direction never                      //
+// needed ANY of this: decode points their eac_dest_reg at A7 unconditionally (same                  //
+// "dummy anchor" trick BSR uses) purely so raddr_b's default read is harmless, not                   //
+// because anything downstream actually depends on it. Their SR/control-register                      //
+// write itself (when NOT faulting) is entirely ap040_execute.v's job -- this stage                     //
+// just threads eaf_is_movesr/eaf_is_movec/eaf_movec_dir/eaf_movec_sel through                           //
+// unchanged, the same mechanical pass-through every other classification flag gets.                      //
 //--------------------------------------------------------------------------//
 
 module ap040_ea_fetch
@@ -231,12 +254,22 @@ module ap040_ea_fetch
 	input             eac_is_jsr,
 	input             eac_is_trap,
 	input             eac_is_illegal,
+	input             eac_is_movesr,
+	input             eac_is_movec,
 	input       [3:0] eac_cond,
 
-	// Architectural CCR, write-through forwarded -- see
-	// ap040_pipe_core.v's ccr_resolved. Needed only to synthesize the SR
-	// word an exception frame pushes -- see header.
-	input       [4:0] ccr_in,
+	// Architectural SR (milestone 15: widened from a 5-bit CCR-only port to
+	// the full 16-bit register, write-through forwarded -- see
+	// ap040_pipe_core.v's sr_resolved). The exception frame's SR word is now
+	// simply THIS value, no synthesis -- and sr_in[13] (S) is what a
+	// privilege check actually reads -- see header.
+	input      [15:0] sr_in,
+
+	// ap040_pipe_regfile.v's OWN ISP/MSP state, read directly -- an
+	// exception's stack access must always target one of these, never
+	// whatever bank port B/A7 is currently reading -- see exc_sp_bank above.
+	input      [31:0] isp_in,
+	input      [31:0] msp_in,
 
 	// regfile operand read ports (driven combinationally by this stage;
 	// ap040_pipe_core.v wires raddr_a/b <-> rdata_a/b straight to the
@@ -278,6 +311,18 @@ module ap040_ea_fetch
 	output reg        eaf_is_jsr,
 	output reg        eaf_is_trap,
 	output reg        eaf_is_illegal,
+	output reg        eaf_is_priv,
+	output reg        eaf_is_movesr,
+	output reg        eaf_is_movec,
+	output reg        eaf_movec_dir,
+	output reg  [2:0] eaf_movec_sel,
+	// The live SR AS OF THIS STAGE'S OWN cycle (already correctly EX-
+	// forwarded/write-through resolved via sr_in) -- threaded straight
+	// down to ap040_execute.v for its exception-entry SR-masking
+	// arithmetic, rather than having it read sr_in live a second time one
+	// cycle later, which would close a combinational loop through its own
+	// EX-forward output -- see its header.
+	output reg [15:0] eaf_sr_snapshot,
 	output reg  [3:0] eaf_cond
 );
 
@@ -301,7 +346,17 @@ localparam EXC_BEAT0 = 2'd0, EXC_BEAT1 = 2'd1, EXC_VECRD = 2'd2;
 reg [1:0] exc_ph;
 reg       exc_vec_pending;
 
-wire eac_is_exc    = eac_is_trap || eac_is_illegal;
+// Privilege violation (milestone 15, new): the ONLY dynamic exception
+// trigger in this pipeline -- illegal/TRAP are static decode-time facts,
+// but "is this opcode privileged" (MOVE to SR, MOVEC) says nothing about
+// whether it actually FAULTS; that depends on the LIVE, forwarded S bit,
+// which doesn't exist until here. eac_is_priv_capable is what
+// ap040_decode.v recognized; eac_is_priv is whether it actually fires THIS
+// cycle -- see header for why the check couldn't happen any earlier.
+wire eac_is_priv_capable = eac_is_movesr || eac_is_movec;
+wire eac_is_priv         = eac_is_priv_capable && !sr_in[13];
+
+wire eac_is_exc    = eac_is_trap || eac_is_illegal || eac_is_priv;
 wire exc_active    = eac_valid && eac_is_exc;
 wire exc_writing   = exc_active && !exc_vec_pending &&
                       (exc_ph == EXC_BEAT0 || exc_ph == EXC_BEAT1);
@@ -312,6 +367,15 @@ wire exc_stall     = exc_active && !exc_vec_done;
 
 assign eaf_stall = stall_in || mem_issue || wr_stall || exc_stall;
 assign raddr_a    = eac_src_reg;
+// A privilege violation reroutes port B to A7 REGARDLESS of what the
+// faulting instruction's own eac_dest_reg says (MOVEC's read direction
+// points it at the destination GPR, Rn, for its NORMAL case) -- but NOT via
+// port B/operand_b at all (see exc_new_sp below for why: an exception's OWN
+// stack access must never go through the CURRENTLY active bank, which could
+// be USP). raddr_b stays the plain, unconditional eac_dest_reg -- MOVEC's
+// read direction doesn't actually need port B for its result either (that
+// comes from creg_read_value in ap040_execute.v, entirely bypassing this
+// port), so there is no live conflict left to resolve here at all.
 assign raddr_b    = eac_dest_reg;
 
 wire fwd_a_from_ex = ex_fwd_valid && (ex_fwd_dest == eac_src_reg);
@@ -346,16 +410,38 @@ wire [31:0] ea_target = operand_a + eac_imm;
 // set eac_dest_reg to A7's unified index for both -- see header).
 wire [31:0] push_addr = operand_b - 32'd4;
 
-// TRAP #n / illegal instruction: A7's NEW value after a format-$0 (8-byte)
-// frame -- same "operand_b via port B" trick, decode having pointed
-// eac_dest_reg at A7 for these too. Recomputed live off eac_/ccr_in every
-// cycle of the sequence rather than latched once: eac_* is frozen by
-// exc_stall the whole time anyway (nothing downstream can change it), so a
-// latch would just be a redundant copy -- see header.
-wire [31:0] exc_new_sp     = operand_b - 32'd8;
-wire [15:0] exc_sr_word    = {8'b0010_0000, 3'b000, ccr_in};
-wire [31:0] exc_pc_field   = eac_is_illegal ? eac_pc : eac_next_pc;
-wire  [7:0] exc_vec_num    = eac_is_illegal ? 8'd4 : eac_imm[7:0];
+// TRAP #n / illegal instruction / privilege violation: A7's NEW value after
+// a format-$0 (8-byte) frame -- but NOT computed from operand_b/port B,
+// unlike BSR/JSR's push_addr above. An exception's own stack access must
+// ALWAYS target a SUPERVISOR stack (ISP, or MSP if M=1 -- never USP),
+// regardless of which bank was active when the fault occurred: a privilege
+// violation taken WHILE ALREADY IN USER MODE (S=0) would otherwise read
+// port B's A7 as USP and silently push its own exception frame onto the
+// user stack -- confirmed wrong against ap040_core.v's own S_EXC0/S_EXC1
+// ordering (`sr[13]<=1` commits a FULL CYCLE before `dbg_a7` -- itself
+// bank-selected off the now-already-supervisor sr -- is read for the
+// stack pointer), not assumed. isp_in/msp_in are ap040_pipe_regfile.v's
+// OWN state, read directly (same "fed straight from its real home"
+// precedent ap040_execute.v's MOVEC-read inputs already established),
+// completely bypassing whatever bank sr_s/sr_m currently have port B
+// pointed at. Recomputed live every cycle of the sequence rather than
+// latched once: eac_*/sr_in are frozen by exc_stall the whole time anyway
+// (nothing downstream can change them), so a latch would just be a
+// redundant copy.
+//
+// exc_sr_word (simplified, milestone 15): no more synthesis -- sr_in IS a
+// real, live SR now (was a fixed system-byte constant over just CCR before
+// this milestone), so the pushed word is simply the value being saved,
+// exactly as architecturally required.
+wire [31:0] exc_sp_bank    = sr_in[12] ? msp_in : isp_in;   // M selects ISP vs MSP; S is irrelevant here
+wire [31:0] exc_new_sp     = exc_sp_bank - 32'd8;
+wire [15:0] exc_sr_word    = sr_in;
+// Illegal and privilege violation both stack the FAULTING instruction's OWN
+// address (go_illegal's/go_priv's shared pc_i convention -- you can't
+// "return past" either kind of fault); TRAP stacks the FOLLOWING
+// instruction's (its return address, a subroutine call).
+wire [31:0] exc_pc_field   = (eac_is_illegal || eac_is_priv) ? eac_pc : eac_next_pc;
+wire  [7:0] exc_vec_num    = eac_is_illegal ? 8'd4 : eac_is_priv ? 8'd8 : eac_imm[7:0];
 wire [15:0] exc_vecoff_word = {4'd0, 2'b00, exc_vec_num, 2'b00};
 
 // Beat0 @ exc_new_sp: SR, then PC's high word. Beat1 @ exc_new_sp+4: PC's
@@ -406,6 +492,12 @@ always @(posedge clk) begin
 		eaf_is_jsr     <= 1'b0;
 		eaf_is_trap    <= 1'b0;
 		eaf_is_illegal <= 1'b0;
+		eaf_is_priv    <= 1'b0;
+		eaf_is_movesr  <= 1'b0;
+		eaf_is_movec   <= 1'b0;
+		eaf_movec_dir  <= 1'b0;
+		eaf_movec_sel  <= 3'h0;
+		eaf_sr_snapshot<= 16'h0;
 		eaf_cond       <= 4'h0;
 		mem_pending    <= 1'b0;
 		exc_ph          <= EXC_BEAT0;
@@ -439,11 +531,15 @@ always @(posedge clk) begin
 				eaf_is_branch  <= eac_is_branch;
 				eaf_is_scc     <= eac_is_scc;
 				eaf_is_dbcc    <= eac_is_dbcc;
-				eaf_is_jmp     <= 1'b0;   // a mem-source instruction is never also a JMP/BSR/JSR/TRAP/illegal
+				eaf_is_jmp     <= 1'b0;   // a mem-source instruction is never also a JMP/BSR/JSR/TRAP/illegal/priv/movesr/movec
 				eaf_is_bsr     <= 1'b0;
 				eaf_is_jsr     <= 1'b0;
 				eaf_is_trap    <= 1'b0;
 				eaf_is_illegal <= 1'b0;
+				eaf_is_priv    <= 1'b0;
+				eaf_is_movesr  <= 1'b0;
+				eaf_is_movec   <= 1'b0;
+				eaf_sr_snapshot<= sr_in;
 				eaf_cond       <= eac_cond;
 				mem_pending    <= 1'b0;
 			end else if (wr_stall) begin
@@ -481,11 +577,27 @@ always @(posedge clk) begin
 				eaf_valid      <= eac_valid;
 				eaf_pc         <= eac_pc;
 				eaf_next_pc    <= eac_next_pc;
-				eaf_dest_reg   <= eac_dest_reg;
+				// eac_dest_reg is ALREADY A7 for illegal/TRAP/MOVE-to-SR/
+				// MOVEC-write (decode's static "dummy anchor" trick, same as
+				// BSR/JSR) -- the one case that genuinely needs overriding
+				// here is a privilege violation on MOVEC's READ direction,
+				// where eac_dest_reg is Rn (the instruction's own, now-
+				// suppressed, real destination): the exception's OWN result
+				// (the new supervisor SP, see exc_sp_bank above) must commit
+				// to A7, not Rn.
+				eaf_dest_reg   <= eac_is_priv ? 4'd15 : eac_dest_reg;
 				eaf_operand_a  <= l1_q_b;
 				eaf_operand_b  <= exc_new_sp;
 				eaf_alu_op     <= eac_alu_op;
-				eaf_writes_reg <= eac_writes_reg;
+				// UNCONDITIONALLY 1, not forwarded from eac_writes_reg:
+				// every exception entry writes A7 the new SP, full stop --
+				// illegal/TRAP already had eac_writes_reg=1 for this exact
+				// reason, but MOVE-to-SR/MOVEC-write have eac_writes_reg=0
+				// in their OWN normal case (they don't write a GPR at all
+				// normally -- see ap040_decode.v's header), which would
+				// silently skip A7's commit on their privilege-violation
+				// path if forwarded here.
+				eaf_writes_reg <= 1'b1;
 				eaf_writes_ccr <= eac_writes_ccr;
 				eaf_is_branch  <= 1'b0;
 				eaf_is_scc     <= 1'b0;
@@ -495,6 +607,20 @@ always @(posedge clk) begin
 				eaf_is_jsr     <= 1'b0;
 				eaf_is_trap    <= eac_is_trap;
 				eaf_is_illegal <= eac_is_illegal;
+				eaf_is_priv    <= eac_is_priv;
+				// The original (now-suppressed) instruction's own semantics
+				// must not reach EX -- a MOVEC/MOVE-to-SR that just faulted
+				// is NOT also still a MOVEC/MOVE-to-SR as far as
+				// ap040_execute.v is concerned, exactly like a mem-source
+				// instruction is never also a JMP above.
+				eaf_is_movesr  <= 1'b0;
+				eaf_is_movec   <= 1'b0;
+				// The value ap040_execute.v's exception-masking arithmetic
+				// needs -- captured HERE (this stage's own already-forwarded
+				// read), not re-read live one cycle later there, to avoid a
+				// combinational loop through EX's own SR forward -- see its
+				// header.
+				eaf_sr_snapshot <= sr_in;
 				eaf_cond       <= eac_cond;
 				exc_ph          <= EXC_BEAT0;
 				exc_vec_pending <= 1'b0;
@@ -525,6 +651,19 @@ always @(posedge clk) begin
 				eaf_is_jsr     <= eac_is_jsr;
 				eaf_is_trap    <= eac_is_trap;
 				eaf_is_illegal <= eac_is_illegal;
+				// This branch is only reached for a MOVE-to-SR/MOVEC
+				// instruction when eac_is_priv is FALSE this cycle (any
+				// privilege-violating one routes into exc_writing/
+				// exc_vec_issue/exc_vec_done above instead, via exc_active)
+				// -- so threading them straight through here is exactly the
+				// "genuinely not faulting" case, no additional gating
+				// needed.
+				eaf_is_priv    <= 1'b0;
+				eaf_is_movesr  <= eac_is_movesr;
+				eaf_is_movec   <= eac_is_movec;
+				eaf_movec_dir  <= eac_imm[3];
+				eaf_movec_sel  <= eac_imm[2:0];
+				eaf_sr_snapshot<= sr_in;
 				eaf_cond       <= eac_cond;
 			end
 		end

@@ -1,5 +1,6 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 14: exceptions)     //
+// AP040_PIPE - MC68040-style pipelined core (milestone 15: supervisor      //
+// state)                                                                   //
 //                                                                          //
 // ap040_pipe_core.v - top level: wires IF/ID/EA-calc/EA-fetch/EX/WB into a //
 // real six-stage pipeline with a synchronous stall/flush chain,            //
@@ -48,12 +49,14 @@
 // picture, including the mutation test that confirmed a separate            //
 // WB-forward mux there would have been redundant.                          //
 //                                                                          //
-// CCR forwarding: the same write-through shape used for GPRs is reused     //
-// for the single CCR register: ccr_resolved = commit_ccr ? exe_result_     //
-// flags : ccr. This is the only forwarding source ap040_execute.v's Bcc     //
-// condition check (and, this milestone, Scc's byte fill) needs -- see its   //
-// header comment for why an EX-live tap (the second source GPR forwarding   //
-// needed) isn't necessary here.                                            //
+// CCR/SR forwarding: the same write-through shape used for GPRs is reused   //
+// for the architectural SR register: sr_resolved = commit_sr ? exe_sr_data  //
+// : commit_ccr ? {sr[15:5],exe_result_flags} : sr (milestone 15 widened     //
+// this from a CCR-only 5-bit version -- see its own note below). This is    //
+// the only forwarding source ap040_execute.v's Bcc condition check (and,    //
+// since milestone 6, Scc's byte fill) needs -- see its header comment for   //
+// why an EX-live tap (the second source GPR forwarding needed) isn't        //
+// necessary here.                                                          //
 //                                                                          //
 // commit_reg vs commit_ccr (new this milestone): these were a single        //
 // `commit` signal through milestone 5, correct because every writing        //
@@ -111,7 +114,25 @@
 // existing commit_reg path below unchanged (ap040_decode.v points its              //
 // eac_dest_reg at A7's unified index, same as any other register-writing            //
 // instruction) -- nothing new needed at this level for that half either.             //
+//                                                                          //
+// Milestone 15 replaces the bare 5-bit `ccr` register with a real 16-bit    //
+// `sr` (T1/T0/S/M/IPL/CCR, matching AP040_SR_RESET's layout exactly) and     //
+// adds VBR/SFC/DFC/CACR -- the supervisor state MOVEC/MOVE-to-SR/privilege   //
+// violation all need. sr_s/sr_m feeding ap040_pipe_regfile.v's A7 bank are   //
+// finally REAL bits of live state (sr[13]/sr[12]), not hardwired constants;  //
+// the regfile's own aux_we/aux_sel/aux_wdata port -- present since the        //
+// register file was first written, unused until now -- gets its first real    //
+// driver, for MOVEC's USP/ISP/MSP targets. Three new commit paths join         //
+// commit_reg/commit_ccr: commit_sr (MOVE-to-SR, or an exception forcing S=1     //
+// unconditionally on entry) writes the WHOLE sr register at once; commit_creg    //
+// (MOVEC's write direction) writes exactly one of VBR/SFC/DFC/CACR/USP/ISP/       //
+// MSP, selected by ap040_execute.v's exe_creg_sel. See ap040_ea_fetch.v's           //
+// header for where the privilege check itself happens (dynamically, off the         //
+// live S bit -- decode alone can't know it) and ap040_execute.v's header for         //
+// the exact SR-masking arithmetic exception entry applies.                            //
 //--------------------------------------------------------------------------//
+
+`include "ap040_pipe_defs.svh"
 
 module ap040_pipe_core
 #(
@@ -133,7 +154,12 @@ module ap040_pipe_core
 
 	output [31:0] dbg_d0, output [31:0] dbg_d1, output [31:0] dbg_d2, output [31:0] dbg_d3,
 	output [31:0] dbg_d4, output [31:0] dbg_d5, output [31:0] dbg_d6, output [31:0] dbg_d7,
-	output  [4:0] dbg_ccr
+	output  [4:0] dbg_ccr,
+	// Full 16-bit SR (milestone 15, new) -- dbg_ccr stays sr[4:0] for every
+	// existing testbench's sake; this is the ONLY way a test can observe
+	// S/M/T1/T0/IPL without a real MOVE-from-SR instruction (deliberately
+	// not built this milestone -- see ap040_decode.v's header).
+	output [15:0] dbg_sr
 );
 
 wire        if_valid;  wire [31:0] if_pc;  wire [15:0] if_opcode;
@@ -145,6 +171,7 @@ wire  [5:0] id_alu_op;
 wire        id_src_a_is_imm, id_writes_reg, id_writes_ccr;
 wire        id_is_branch, id_is_scc, id_is_dbcc, id_is_mem_src, id_is_jmp;
 wire        id_is_bsr, id_is_jsr, id_is_trap, id_is_illegal;
+wire        id_is_movesr, id_is_movec;
 wire  [3:0] id_cond;
 
 wire        eac_valid; wire [31:0] eac_pc; wire [31:0] eac_next_pc;
@@ -154,6 +181,7 @@ wire  [5:0] eac_alu_op;
 wire        eac_src_a_is_imm, eac_writes_reg, eac_writes_ccr;
 wire        eac_is_branch, eac_is_scc, eac_is_dbcc, eac_is_mem_src, eac_is_jmp;
 wire        eac_is_bsr, eac_is_jsr, eac_is_trap, eac_is_illegal;
+wire        eac_is_movesr, eac_is_movec;
 wire  [3:0] eac_cond;
 
 wire        eaf_valid; wire [31:0] eaf_pc; wire [31:0] eaf_next_pc;
@@ -163,6 +191,10 @@ wire  [5:0] eaf_alu_op;
 wire        eaf_writes_reg, eaf_writes_ccr;
 wire        eaf_is_branch, eaf_is_scc, eaf_is_dbcc, eaf_is_jmp;
 wire        eaf_is_bsr, eaf_is_jsr, eaf_is_trap, eaf_is_illegal;
+wire        eaf_is_priv, eaf_is_movesr, eaf_is_movec;
+wire        eaf_movec_dir;
+wire  [2:0] eaf_movec_sel;
+wire [15:0] eaf_sr_snapshot;
 wire  [3:0] eaf_cond;
 
 wire        exe_valid; wire [31:0] exe_pc;
@@ -170,6 +202,11 @@ wire  [3:0] exe_dest_reg;
 wire [31:0] exe_result_data;
 wire        exe_writes_reg, exe_writes_ccr;
 wire  [4:0] exe_result_flags;
+wire        exe_writes_sr;
+wire [15:0] exe_sr_data;
+wire        exe_writes_creg;
+wire  [2:0] exe_creg_sel;
+wire [31:0] exe_creg_data;
 
 wire        wb_valid;  wire [31:0] wb_pc;
 
@@ -209,31 +246,120 @@ wire        ex_fwd_valid;
 wire  [3:0] ex_fwd_dest;
 wire [31:0] ex_fwd_data;
 
-// The instruction committing this cycle. Two separate gates, not one --
-// see this file's header comment on commit_reg vs commit_ccr.
-wire commit_reg = exe_valid && exe_writes_reg;
-wire commit_ccr = exe_valid && exe_writes_ccr;
+// SR's OWN EX-forward tap (milestone 15, new) -- see ap040_execute.v's
+// header for why this exists in addition to sr_resolved's write-through
+// (commit_sr) term below: a MOVE-to-SR/exception still sitting in EX this
+// cycle, not yet committed, must still be visible to whatever's reading
+// live S/M bits one stage EARLIER (ap040_ea_fetch.v's privilege check,
+// ap040_pipe_regfile.v's own A7 bank select) the SAME cycle.
+wire        ex_sr_fwd_valid;
+wire [15:0] ex_sr_fwd_data;
 
-// Architectural CCR (XNZVC), updated at commit_ccr (not commit_reg -- Scc
-// writes a register without touching CCR).
-reg [4:0] ccr;
+// The instruction committing this cycle. Four separate gates, not one --
+// see this file's header comment on commit_reg vs commit_ccr, and the new
+// milestone-15 note on commit_sr/commit_creg.
+wire commit_reg  = exe_valid && exe_writes_reg;
+wire commit_ccr  = exe_valid && exe_writes_ccr;
+wire commit_sr   = exe_valid && exe_writes_sr;
+wire commit_creg = exe_valid && exe_writes_creg;
+
+// Architectural SR (milestone 15: widened from a bare 5-bit CCR to the real
+// 16-bit register -- T1/T0/S/M/-/IPL/-/-/-/CCR, AP040_SR_RESET's own
+// layout). commit_sr (MOVE-to-SR, or exception entry forcing S=1/T1:T0=00 --
+// see ap040_execute.v's header for exactly which) writes all 16 bits at
+// once; commit_ccr (every ordinary flag-setting ALU op) still only ever
+// touches the low 5 -- Scc/DBcc/etc.'s existing behavior is completely
+// unchanged, this is a strictly additive second write path, not a
+// replacement of the first.
+reg [15:0] sr;
 
 always @(posedge clk) begin
 	if (!nreset)
-		ccr <= 5'h0;
-	else if (ce && commit_ccr)
-		ccr <= exe_result_flags;
+		sr <= `AP040_SR_RESET;
+	else if (ce) begin
+		if (commit_sr)      sr <= exe_sr_data;
+		else if (commit_ccr) sr[4:0] <= exe_result_flags;
+	end
 end
 
-assign dbg_ccr = ccr;
+assign dbg_ccr = sr[4:0];
+assign dbg_sr  = sr;
 
-// CCR write-through forward, mirroring the regfile's own write-through
-// bypass: a producer committing THIS cycle is visible to a same-cycle
-// reader without waiting for the ccr register's own next edge. This is the
-// only CCR-forwarding source ap040_execute.v's Bcc/Scc condition check
-// needs -- see its header comment. Gated on commit_ccr, not commit_reg:
-// Scc committing must not forward its (meaningless, discarded) ALU flags.
-wire [4:0] ccr_resolved = commit_ccr ? exe_result_flags : ccr;
+// SR resolution: THREE sources, priority-ordered, not two -- ex_sr_fwd_valid
+// (a producer still IN EX this cycle, not yet committed -- the same "one
+// stage ahead" case ex_fwd_* covers for GPRs) takes priority over commit_sr
+// (a producer committing THIS cycle, mirroring the regfile's own write-
+// through bypass and CCR's prior single-purpose version of this same
+// mux), which takes priority over the plain registered value. Both new
+// terms were added together, in the same milestone-15 pass that first
+// gave ap040_ea_fetch.v a live SR consumer earlier than EX -- see
+// ap040_execute.v's header for the actual hazard this fixes (verified by
+// tb_ap040_pipe_sup.v initially FAILING without ex_sr_fwd_valid: a BSR one
+// instruction behind a MOVE-to-SR read A7 through the stale, pre-switch
+// bank for exactly one cycle). ap040_execute.v's Bcc/Scc condition check
+// only ever reads the low 5 bits of this (still wired as a separate
+// `ccr_in` port there, unchanged); ap040_ea_fetch.v's exception-frame push
+// and privilege check need the FULL 16 bits, hence sr_resolved staying the
+// whole register, not just CCR.
+wire [15:0] sr_resolved = ex_sr_fwd_valid ? ex_sr_fwd_data :
+                          commit_sr       ? exe_sr_data :
+                          commit_ccr      ? {sr[15:5], exe_result_flags} : sr;
+
+//---------------------------------------------------------------------------
+// Supervisor control registers (milestone 15, new): VBR/SFC/DFC/CACR, the
+// four this core's current scope actually needs (the MMU registers --
+// TC/ITT0/ITT1/DTT0/DTT1/URP/SRP/MMUSR -- are explicitly out of scope, per
+// the user's own framing; ap040_decode.v's MOVEC selector validation
+// rejects them as illegal rather than silently accepting or dropping them).
+// USP/ISP/MSP already exist -- ap040_pipe_regfile.v has held all three
+// since this fork was first written -- so they're not duplicated here; see
+// its aux_we wiring below for how MOVEC reaches them directly, bypassing
+// whichever bank sr_s/sr_m currently have A7 pointed at.
+//
+// CACR is intentionally a plain, behaviorally inert register: this
+// substrate's unified L1 (see section 5a of AP040_IMPLEMENTATION_PLAN.md)
+// has no per-way enable/disable concept to actually gate, the same
+// "diminished capacity" the plan doc already flagged for CINV/CPUSH.
+// Masked identically to ap040_core.v's own S_MOVEC2 (`& 32'h8000_8000`) so
+// a read-back is bit-exact even though neither bit does anything here.
+//---------------------------------------------------------------------------
+
+reg [31:0] vbr;
+reg  [2:0] sfc, dfc;
+reg [31:0] cacr;
+
+always @(posedge clk) begin
+	if (!nreset) begin
+		vbr  <= 32'h0;
+		sfc  <= 3'h0;
+		dfc  <= 3'h0;
+		cacr <= 32'h0;
+	end else if (ce && commit_creg) begin
+		case (exe_creg_sel)
+			`AP040_CREG_SFC:  sfc  <= exe_creg_data[2:0];
+			`AP040_CREG_DFC:  dfc  <= exe_creg_data[2:0];
+			`AP040_CREG_CACR: cacr <= exe_creg_data & 32'h8000_8000;
+			`AP040_CREG_VBR:  vbr  <= exe_creg_data;
+			default: ;   // USP/ISP/MSP route through the regfile's aux port instead
+		endcase
+	end
+end
+
+wire [31:0] usp_q, isp_q, msp_q;   // ap040_pipe_regfile.v's own state, read
+                                    // back here for MOVEC's read direction
+
+// MOVEC's write direction reaching USP/ISP/MSP bypasses ap040_pipe_regfile.v's
+// normal commit_reg path (which would bank through whichever of the three
+// sr_s/sr_m currently selects) and drives its aux port directly instead --
+// exactly the mechanism that port has existed for since this fork was first
+// written, unused until now. aux_sel's 0=USP/1=ISP/2=MSP numbering is one
+// bit-shift away from AP040_CREG_USP/ISP/MSP's own 4/5/6 -- see
+// ap040_pipe_defs.svh's comment on why that ordering was chosen.
+wire        aux_we    = commit_creg && (exe_creg_sel == `AP040_CREG_USP ||
+                                          exe_creg_sel == `AP040_CREG_ISP ||
+                                          exe_creg_sel == `AP040_CREG_MSP);
+wire [1:0]  aux_sel    = exe_creg_sel[1:0];   // USP=4'b100->00, ISP=101->01, MSP=110->10
+wire [31:0] aux_wdata  = exe_creg_data;
 
 //---------------------------------------------------------------------------
 // Register file: this directory's own fork (ap040_pipe_regfile.v, see its
@@ -250,8 +376,19 @@ ap040_pipe_regfile u_regfile
 	.ce       (ce),
 	.nreset   (nreset),
 
-	.sr_s     (1'b1),   // supervisor, matches AP040_SR_RESET's S=1/M=0;
-	.sr_m     (1'b0),   // nothing in this milestone touches A7/stack
+	// Real, live bits now (milestone 15) -- was hardwired 1'b1/1'b0 through
+	// milestone 14, since nothing touched them yet. sr_resolved, not the
+	// raw sr register: MOVE-to-SR's own write-through forward, same reason
+	// every other same-cycle producer/consumer pair in this pipeline needs
+	// one -- an immediately-following instruction that touches A7 (say, a
+	// BSR right after a MOVE-to-SR that just dropped to user mode) is in
+	// EA-fetch reading THIS port the exact cycle MOVE-to-SR's commit lands;
+	// the raw registered `sr` wouldn't reflect that write until the NEXT
+	// cycle, banking A7 through the stale PRE-switch stack for one cycle.
+	// sr[13]/sr[12] reset to AP040_SR_RESET's own S=1/M=0, so A7 still
+	// banks to ISP at reset, unchanged behavior for every earlier test.
+	.sr_s     (sr_resolved[13]),
+	.sr_m     (sr_resolved[12]),
 
 	.we       (commit_reg),
 	.waddr    (exe_dest_reg),
@@ -262,12 +399,12 @@ ap040_pipe_regfile u_regfile
 	.raddr_b  (raddr_b),
 	.rdata_b  (rdata_b),
 
-	.aux_we   (1'b0),
-	.aux_sel  (2'd0),
-	.aux_wdata(32'h0),
-	.usp_q    (),
-	.isp_q    (),
-	.msp_q    (),
+	.aux_we   (aux_we),
+	.aux_sel  (aux_sel),
+	.aux_wdata(aux_wdata),
+	.usp_q    (usp_q),
+	.isp_q    (isp_q),
+	.msp_q    (msp_q),
 
 	.dbg_d0   (dbg_d0),
 	.dbg_d1   (dbg_d1),
@@ -381,6 +518,8 @@ ap040_decode u_id
 	.id_is_jsr       (id_is_jsr),
 	.id_is_trap      (id_is_trap),
 	.id_is_illegal   (id_is_illegal),
+	.id_is_movesr    (id_is_movesr),
+	.id_is_movec     (id_is_movec),
 	.id_cond         (id_cond)
 );
 
@@ -411,6 +550,8 @@ ap040_ea_calc u_eac
 	.id_is_jsr        (id_is_jsr),
 	.id_is_trap       (id_is_trap),
 	.id_is_illegal    (id_is_illegal),
+	.id_is_movesr     (id_is_movesr),
+	.id_is_movec      (id_is_movec),
 	.id_cond          (id_cond),
 
 	.ea_stall         (ea_stall),
@@ -434,6 +575,8 @@ ap040_ea_calc u_eac
 	.eac_is_jsr       (eac_is_jsr),
 	.eac_is_trap      (eac_is_trap),
 	.eac_is_illegal   (eac_is_illegal),
+	.eac_is_movesr    (eac_is_movesr),
+	.eac_is_movec     (eac_is_movec),
 	.eac_cond         (eac_cond)
 );
 
@@ -467,9 +610,13 @@ ap040_ea_fetch #(
 	.eac_is_jsr       (eac_is_jsr),
 	.eac_is_trap      (eac_is_trap),
 	.eac_is_illegal   (eac_is_illegal),
+	.eac_is_movesr    (eac_is_movesr),
+	.eac_is_movec     (eac_is_movec),
 	.eac_cond         (eac_cond),
 
-	.ccr_in           (ccr_resolved),
+	.sr_in            (sr_resolved),
+	.isp_in           (isp_q),
+	.msp_in           (msp_q),
 
 	.raddr_a          (raddr_a),
 	.rdata_a          (rdata_a),
@@ -505,6 +652,12 @@ ap040_ea_fetch #(
 	.eaf_is_jsr       (eaf_is_jsr),
 	.eaf_is_trap      (eaf_is_trap),
 	.eaf_is_illegal   (eaf_is_illegal),
+	.eaf_is_priv      (eaf_is_priv),
+	.eaf_is_movesr    (eaf_is_movesr),
+	.eaf_is_movec     (eaf_is_movec),
+	.eaf_movec_dir    (eaf_movec_dir),
+	.eaf_movec_sel    (eaf_movec_sel),
+	.eaf_sr_snapshot  (eaf_sr_snapshot),
 	.eaf_cond         (eaf_cond)
 );
 
@@ -532,15 +685,32 @@ ap040_execute u_ex
 	.eaf_is_jsr       (eaf_is_jsr),
 	.eaf_is_trap      (eaf_is_trap),
 	.eaf_is_illegal   (eaf_is_illegal),
+	.eaf_is_priv      (eaf_is_priv),
+	.eaf_is_movesr    (eaf_is_movesr),
+	.eaf_is_movec     (eaf_is_movec),
+	.eaf_movec_dir    (eaf_movec_dir),
+	.eaf_movec_sel    (eaf_movec_sel),
+	.eaf_sr_snapshot  (eaf_sr_snapshot),
 	.eaf_cond         (eaf_cond),
 
-	.ccr_in           (ccr_resolved),
+	.ccr_in           (sr_resolved[4:0]),
+
+	.sfc_in           ({29'd0, sfc}),
+	.dfc_in           ({29'd0, dfc}),
+	.cacr_in          (cacr),
+	.vbr_in           (vbr),
+	.usp_in           (usp_q),
+	.isp_in           (isp_q),
+	.msp_in           (msp_q),
 
 	.ex_stall         (ex_stall),
 
 	.ex_fwd_valid     (ex_fwd_valid),
 	.ex_fwd_dest      (ex_fwd_dest),
 	.ex_fwd_data      (ex_fwd_data),
+
+	.ex_sr_fwd_valid  (ex_sr_fwd_valid),
+	.ex_sr_fwd_data   (ex_sr_fwd_data),
 
 	.ex_mispredict    (ex_mispredict),
 	.ex_recovery_pc   (ex_recovery_pc),
@@ -551,7 +721,13 @@ ap040_execute u_ex
 	.exe_result_data  (exe_result_data),
 	.exe_writes_reg   (exe_writes_reg),
 	.exe_writes_ccr   (exe_writes_ccr),
-	.exe_result_flags (exe_result_flags)
+	.exe_result_flags (exe_result_flags),
+
+	.exe_writes_sr    (exe_writes_sr),
+	.exe_sr_data      (exe_sr_data),
+	.exe_writes_creg  (exe_writes_creg),
+	.exe_creg_sel     (exe_creg_sel),
+	.exe_creg_data    (exe_creg_data)
 );
 
 ap040_writeback u_wb

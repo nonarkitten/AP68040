@@ -146,12 +146,14 @@ initial begin
 		errors = errors + 1;
 		$display("FAIL: D2 = %h, expected 00000007 (illegal handler did not run)", dbg_d2);
 	end
-	// Frame @ SP=$5F8 (word idx $0FC/$0FE): SR=$2000 (S=1, ccr=0),
-	// PC=$00000402 (the illegal opcode's OWN address), FmtVec=$0010
-	// (format 0, vector 4 -> 4*4=$10).
-	if (dut.u_l1.mem[16'h0FC] !== 16'h2000 || dut.u_l1.mem[16'h0FD] !== 16'h0000) begin
+	// Frame @ SP=$5F8 (word idx $0FC/$0FE): SR=$2700 (AP040_SR_RESET's own
+	// value -- milestone 15 made SR a real register, and nothing in this
+	// program writes it before the fault, so it's still the reset value:
+	// S=1/IPL=7, ccr=0), PC=$00000402 (the illegal opcode's OWN address),
+	// FmtVec=$0010 (format 0, vector 4 -> 4*4=$10).
+	if (dut.u_l1.mem[16'h0FC] !== 16'h2700 || dut.u_l1.mem[16'h0FD] !== 16'h0000) begin
 		errors = errors + 1;
-		$display("FAIL: illegal frame word0 (SR:PChi) = %h%h, expected 20000000",
+		$display("FAIL: illegal frame word0 (SR:PChi) = %h%h, expected 27000000",
 		          dut.u_l1.mem[16'h0FC], dut.u_l1.mem[16'h0FD]);
 	end
 	if (dut.u_l1.mem[16'h0FE] !== 16'h0402 || dut.u_l1.mem[16'h0FF] !== 16'h0010) begin
@@ -169,12 +171,14 @@ initial begin
 		errors = errors + 1;
 		$display("FAIL: D4 = %h, expected 00000009 (TRAP handler did not run)", dbg_d4);
 	end
-	// Frame @ SP=$5F0 (word idx $0F8/$0FA): SR=$2000, PC=$00000408 (the
+	// Frame @ SP=$5F0 (word idx $0F8/$0FA): SR=$2700 (same reset value as
+	// case A -- the illegal handler's MOVEQ #7,D2 sets N=Z=V=C=0, X
+	// unchanged, so it doesn't perturb SR either), PC=$00000408 (the
 	// FOLLOWING instruction's address -- TRAP's return address, not its
 	// own), FmtVec=$0094 (format 0, vector 37 -> 37*4=$94).
-	if (dut.u_l1.mem[16'h0F8] !== 16'h2000 || dut.u_l1.mem[16'h0F9] !== 16'h0000) begin
+	if (dut.u_l1.mem[16'h0F8] !== 16'h2700 || dut.u_l1.mem[16'h0F9] !== 16'h0000) begin
 		errors = errors + 1;
-		$display("FAIL: TRAP frame word0 (SR:PChi) = %h%h, expected 20000000",
+		$display("FAIL: TRAP frame word0 (SR:PChi) = %h%h, expected 27000000",
 		          dut.u_l1.mem[16'h0F8], dut.u_l1.mem[16'h0F9]);
 	end
 	if (dut.u_l1.mem[16'h0FA] !== 16'h0408 || dut.u_l1.mem[16'h0FB] !== 16'h0094) begin

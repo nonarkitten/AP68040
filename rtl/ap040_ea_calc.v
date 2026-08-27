@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 14: exceptions)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 15: supervisor state)       //
 //                                                                          //
 // ap040_ea_calc.v - EA-calc stage                                         //
 //                                                                          //
@@ -40,6 +40,16 @@
 // trap/id_is_illegal just thread through unchanged, same shape as every       //
 // other flag above.                                                          //
 //                                                                          //
+// MOVE to SR / MOVEC (milestone 15, new): a fourth and fifth flavor of the    //
+// same story, PLUS a genuinely dynamic wrinkle this stage still doesn't       //
+// need to know about -- whether either one actually FAULTS (privilege         //
+// violation) depends on the live, forwarded S bit, which doesn't exist         //
+// until ap040_ea_fetch.v/ap040_execute.v. id_is_movesr/id_is_movec thread       //
+// through unchanged either way; the fault decision and its consequences         //
+// (suppressing the normal SR/control-register write, rerouting port B to         //
+// A7 for the exception's own push) are entirely ap040_ea_fetch.v's job -- see     //
+// its header.                                                                     //
+//                                                                          //
 // flush: when ap040_execute.v detects a mispredicted branch, everything     //
 // speculatively fetched behind it -- including whatever is sitting here -- //
 // must be discarded. Same shape as stall_in but forces a bubble instead     //
@@ -73,6 +83,8 @@ module ap040_ea_calc
 	input             id_is_jsr,
 	input             id_is_trap,
 	input             id_is_illegal,
+	input             id_is_movesr,
+	input             id_is_movec,
 	input       [3:0] id_cond,
 
 	output            ea_stall,   // to ID: no local stall of its own yet
@@ -96,6 +108,8 @@ module ap040_ea_calc
 	output reg        eac_is_jsr,
 	output reg        eac_is_trap,
 	output reg        eac_is_illegal,
+	output reg        eac_is_movesr,
+	output reg        eac_is_movec,
 	output reg  [3:0] eac_cond
 );
 
@@ -122,6 +136,8 @@ always @(posedge clk) begin
 		eac_is_jsr       <= 1'b0;
 		eac_is_trap      <= 1'b0;
 		eac_is_illegal   <= 1'b0;
+		eac_is_movesr    <= 1'b0;
+		eac_is_movec     <= 1'b0;
 		eac_cond         <= 4'h0;
 	end else if (ce) begin
 		if (flush) begin
@@ -146,6 +162,8 @@ always @(posedge clk) begin
 			eac_is_jsr       <= id_is_jsr;
 			eac_is_trap      <= id_is_trap;
 			eac_is_illegal   <= id_is_illegal;
+			eac_is_movesr    <= id_is_movesr;
+			eac_is_movec     <= id_is_movec;
 			eac_cond         <= id_cond;
 		end
 	end

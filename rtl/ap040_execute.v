@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 14: exceptions)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 15: supervisor state)       //
 //                                                                          //
 // ap040_execute.v - EX stage                                              //
 //                                                                          //
@@ -125,10 +125,37 @@ module ap040_execute
 	input             eaf_is_jsr,
 	input             eaf_is_trap,
 	input             eaf_is_illegal,
+	input             eaf_is_priv,
+	input             eaf_is_movesr,
+	input             eaf_is_movec,
+	input             eaf_movec_dir,
+	input       [2:0] eaf_movec_sel,
 	input       [3:0] eaf_cond,
 
 	input       [4:0] ccr_in,    // already write-through-forwarded by
 	                              // ap040_pipe_core.v -- see header comment
+	// The OLD (pre-fault) SR, for exception entry's masking arithmetic --
+	// ap040_ea_fetch.v's OWN already-correctly-forwarded read of the SAME
+	// value (its exc_sr_word), threaded straight down rather than read
+	// live again here: this stage's own EX-live SR forward (ex_sr_fwd_*
+	// below) feeds INTO ap040_pipe_core.v's sr_resolved, so taking a fresh
+	// "live" read of sr_resolved back INTO this stage would be a genuine
+	// combinational loop, not just a staleness risk -- see header.
+	input      [15:0] eaf_sr_snapshot,
+
+	// MOVEC's read direction (control register -> GPR): the seven control
+	// registers' CURRENT values, fed straight from ap040_pipe_core.v (their
+	// actual home), not threaded through ap040_decode.v/ap040_ea_calc.v/
+	// ap040_ea_fetch.v at all -- these are live architectural state, not
+	// per-instruction pipeline data, the same reasoning ccr_in is wired
+	// straight in rather than passed stage by stage.
+	input      [31:0] sfc_in,
+	input      [31:0] dfc_in,
+	input      [31:0] cacr_in,
+	input      [31:0] vbr_in,
+	input      [31:0] usp_in,
+	input      [31:0] isp_in,
+	input      [31:0] msp_in,
 
 	output            ex_stall,   // to EA-fetch: no local stall of its own yet
 
@@ -136,6 +163,17 @@ module ap040_execute
 	output            ex_fwd_valid,
 	output      [3:0] ex_fwd_dest,
 	output     [31:0] ex_fwd_data,
+
+	// SR's OWN EX-forward tap (milestone 15, new) -- the same "producer
+	// still here, one stage ahead of a consumer's EA-fetch cycle" case
+	// ex_fwd_* already covers for GPRs, now needed for SR too: a MOVE-to-SR
+	// (or an exception) sitting HERE, not yet committed, must still be
+	// visible to whatever's reading the live S/M bits one stage earlier in
+	// ap040_ea_fetch.v (its eac_is_priv check, or ap040_pipe_regfile.v's
+	// own sr_s/sr_m bank select) THIS SAME cycle -- see
+	// ap040_pipe_core.v's sr_resolved for where this feeds in.
+	output            ex_sr_fwd_valid,
+	output     [15:0] ex_sr_fwd_data,
 
 	// Misprediction signal (combinational, live this cycle) -- see header
 	// comment. ap040_pipe_core.v broadcasts this as `flush` to ID/EA-calc/
@@ -149,7 +187,18 @@ module ap040_execute
 	output reg [31:0] exe_result_data,
 	output reg        exe_writes_reg,
 	output reg        exe_writes_ccr,
-	output reg  [4:0] exe_result_flags
+	output reg  [4:0] exe_result_flags,
+
+	// New commit paths, milestone 15 -- see header. Both gated by exe_valid
+	// exactly like exe_writes_reg/exe_writes_ccr already are; neither ever
+	// fires together with the other (MOVE-to-SR/an exception writes SR;
+	// MOVEC's write direction writes a control register; mutually
+	// exclusive by construction).
+	output reg        exe_writes_sr,
+	output reg [15:0] exe_sr_data,
+	output reg        exe_writes_creg,
+	output reg  [2:0] exe_creg_sel,
+	output reg [31:0] exe_creg_data
 );
 
 assign ex_stall = stall_in;
@@ -241,36 +290,96 @@ wire writes_reg_resolved = eaf_is_dbcc ? (eaf_valid && !cond_result) : eaf_write
 // correct -- see ap040_decode.v's header), so by the time a BSR reaches EX
 // the redirect has already happened and there is nothing left to correct.
 //
-// TRAP #n / illegal instruction (milestone 14): the SAME reasoning as JMP/
-// JSR one more time -- neither has a literal target decode could possibly
-// speculate with (the handler address comes from ap040_ea_fetch.v's own
-// vector-table read, resolved into eaf_operand_a exactly like JMP/JSR's EA
-// -- see its header), so both join this OR-chain unconditionally.
+// TRAP #n / illegal instruction / privilege violation (milestones 14/15):
+// the SAME reasoning as JMP/JSR one more time -- none of the three has a
+// literal target decode could possibly speculate with (the handler address
+// comes from ap040_ea_fetch.v's own vector-table read, resolved into
+// eaf_operand_a exactly like JMP/JSR's EA -- see its header), so all three
+// join this OR-chain unconditionally. eaf_is_priv fires for a privilege
+// violation on MOVE-to-SR/MOVEC -- see ap040_ea_fetch.v's header for where
+// that's actually detected (it's dynamic, not a decode-time fact the way
+// illegal/TRAP are).
+wire exc_reaching_ex = eaf_is_trap || eaf_is_illegal || eaf_is_priv;
+
 assign ex_mispredict   = eaf_valid && ((eaf_is_branch && !cond_result) ||
                                         (eaf_is_dbcc   && !dbcc_branch_taken) ||
                                         eaf_is_jmp || eaf_is_jsr ||
-                                        eaf_is_trap || eaf_is_illegal);
-assign ex_recovery_pc  = (eaf_is_jmp || eaf_is_jsr || eaf_is_trap || eaf_is_illegal)
+                                        exc_reaching_ex);
+assign ex_recovery_pc  = (eaf_is_jmp || eaf_is_jsr || exc_reaching_ex)
                           ? eaf_operand_a : eaf_next_pc;
 
 wire [31:0] scc_fill   = {24'd0, {8{cond_result}}};
 wire [31:0] scc_merged = {eaf_operand_b[31:8], scc_fill[7:0]};
 
-// BSR/JSR/TRAP/illegal: eaf_operand_b already IS the result -- ap040_ea_
-// fetch.v computed the new A7 value there (the same expression it used for
-// the push's write address), so this stage just selects it, the same
+// MOVEC's read direction (milestone 15): the selected control register's
+// CURRENT value (fed straight in from ap040_pipe_core.v -- see the port
+// list above), routed into combined_result exactly like any other GPR-
+// writing instruction's result -- no new commit path needed for this
+// direction at all, it rides the SAME commit_reg/ex_fwd_* machinery every
+// register-writing instruction already uses. Meaningless (and unread) for
+// the write direction, same "compute always, consume conditionally"
+// precedent used throughout this pipeline.
+wire [31:0] creg_read_value = (eaf_movec_sel == `AP040_CREG_SFC)  ? sfc_in  :
+                               (eaf_movec_sel == `AP040_CREG_DFC)  ? dfc_in  :
+                               (eaf_movec_sel == `AP040_CREG_CACR) ? cacr_in :
+                               (eaf_movec_sel == `AP040_CREG_VBR)  ? vbr_in  :
+                               (eaf_movec_sel == `AP040_CREG_USP)  ? usp_in  :
+                               (eaf_movec_sel == `AP040_CREG_ISP)  ? isp_in  :
+                                                                      msp_in;  // AP040_CREG_MSP
+
+// BSR/JSR/TRAP/illegal/priv: eaf_operand_b already IS the result -- ap040_
+// ea_fetch.v computed the new A7 value there (the same expression it used
+// for the push's write address), so this stage just selects it, the same
 // "precomputed elsewhere, EX only picks" shape scc_merged/dbcc_result
 // already use. No generic-ALU op is used for this (eaf_operand_a is busy
 // carrying the redirect/handler target and can't also carry a literal
 // decrement operand) -- see ap040_ea_fetch.v's header.
 wire [31:0] combined_result = eaf_is_scc  ? scc_merged :
                                eaf_is_dbcc ? dbcc_result :
-                               (eaf_is_bsr || eaf_is_jsr || eaf_is_trap || eaf_is_illegal)
-                                 ? eaf_operand_b : alu_result;
+                               (eaf_is_bsr || eaf_is_jsr || exc_reaching_ex)
+                                 ? eaf_operand_b :
+                               (eaf_is_movec && !eaf_movec_dir) ? creg_read_value :
+                                                                    alu_result;
+
+// MOVE to SR (milestone 15, new): writes the WHOLE live SR, not just CCR --
+// a genuinely different commit path from exe_writes_ccr's low-5-bits-only
+// one (Scc/Bcc/DBcc's flags never touch S/M/T/IPL, and this instruction
+// must never touch THEM through the ALU's flags_out path either). Its
+// value is simply eaf_operand_a's low 16 bits -- the source Dn's already-
+// forwarded value, same port A every register-direct source has used since
+// milestone 2, no new operand path.
+//
+// Exception entry (illegal/TRAP/priv) ALSO writes the whole live SR: T1/T0
+// cleared, S forced to 1 (entering the handler in supervisor mode
+// unconditionally, per ap040_core.v's own S_EXC0: `sr[13]<=1; sr[15:14]<=
+// 2'b00;`), M/IPL/CCR preserved from whatever they were the instant before
+// the fault -- computed here off eaf_sr_snapshot (ap040_ea_fetch.v's OWN
+// forwarded read of the SAME live SR, one cycle earlier, for the PUSHED
+// copy -- see its header for why threading it down, not re-reading a live
+// value here, is required, not just tidier). Mutually exclusive with
+// MOVE-to-SR's own write by construction (exc_reaching_ex and
+// eaf_is_movesr can never both be true -- a MOVE-to-SR that faults has its
+// eaf_is_movesr cleared by ap040_ea_fetch.v's exc_vec_done branch).
+wire        exe_writes_sr_c = eaf_valid && (eaf_is_movesr || exc_reaching_ex);
+wire [15:0] exe_sr_data_c   = exc_reaching_ex ? ((eaf_sr_snapshot & 16'h1FFF) | 16'h2000)
+                                               : eaf_operand_a[15:0];
+
+// MOVEC's write direction (milestone 15, new): writes ONE of the seven
+// control registers ap040_pipe_core.v now owns, selected by eaf_movec_sel
+// (ap040_decode.v's validated selector code -- an invalid one never
+// reaches here, having become id_is_illegal instead, see its header).
+// Value is eaf_operand_a again, same source-register path as MOVE-to-SR.
+// Suppressed (like eaf_is_movec itself) whenever this MOVEC just faulted a
+// privilege violation instead -- ap040_ea_fetch.v already cleared
+// eaf_is_movec for that case, so eaf_movec_dir is simply never consulted.
+wire exe_writes_creg_c = eaf_valid && eaf_is_movec && eaf_movec_dir;
 
 assign ex_fwd_valid = eaf_valid && writes_reg_resolved;
 assign ex_fwd_dest  = eaf_dest_reg;
 assign ex_fwd_data  = combined_result;
+
+assign ex_sr_fwd_valid = exe_writes_sr_c;
+assign ex_sr_fwd_data  = exe_sr_data_c;
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -281,6 +390,11 @@ always @(posedge clk) begin
 		exe_writes_reg   <= 1'b0;
 		exe_writes_ccr   <= 1'b0;
 		exe_result_flags <= 5'h0;
+		exe_writes_sr    <= 1'b0;
+		exe_sr_data      <= 16'h0;
+		exe_writes_creg  <= 1'b0;
+		exe_creg_sel     <= 3'h0;
+		exe_creg_data    <= 32'h0;
 	end else if (ce && !stall_in) begin
 		exe_valid        <= eaf_valid;
 		exe_pc           <= eaf_pc;
@@ -289,6 +403,11 @@ always @(posedge clk) begin
 		exe_writes_reg   <= writes_reg_resolved;
 		exe_writes_ccr   <= eaf_writes_ccr;
 		exe_result_flags <= alu_flags;
+		exe_writes_sr    <= exe_writes_sr_c;
+		exe_sr_data      <= exe_sr_data_c;
+		exe_writes_creg  <= exe_writes_creg_c;
+		exe_creg_sel     <= eaf_movec_sel;
+		exe_creg_data    <= eaf_operand_a;
 	end
 end
 

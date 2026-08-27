@@ -26,6 +26,27 @@
 // rather than by field decode.
 `define AP040_OP_NOP      16'h4E71
 
+// SR bit positions and reset value -- milestone 15 (supervisor state).
+// Matches rtl_old/ap040_defs.svh exactly (same architectural encoding).
+`define AP040_SR_S        13
+`define AP040_SR_M        12
+`define AP040_SR_RESET    16'h2700
+
+// MOVEC control-register selector codes (milestone 15) -- this decoder's
+// OWN compact 3-bit encoding, not the raw 12-bit MOVEC selector field
+// (ap040_decode.v maps the real 0x000/0x001/0x002/0x801/0x800/0x804/0x803
+// values into these at gather-completion; any other raw selector is
+// illegal -- see its header). Order is arbitrary, chosen only to keep
+// USP/ISP/MSP contiguous with ap040_pipe_regfile.v's own aux_sel numbering
+// (0=USP/1=ISP/2=MSP) one bit-shift away.
+`define AP040_CREG_SFC     3'd0
+`define AP040_CREG_DFC     3'd1
+`define AP040_CREG_CACR    3'd2
+`define AP040_CREG_VBR     3'd3
+`define AP040_CREG_USP     3'd4
+`define AP040_CREG_ISP     3'd5
+`define AP040_CREG_MSP     3'd6
+
 // ALU operations. ap040_pipe_alu.v's case statement needs every entry to
 // compile even though only MOVE/ADD are driven by any decoder yet.
 `define AP040_ALU_MOVE    6'd0

@@ -102,6 +102,7 @@ Completed milestones (`tb/run_pipe_tests.sh`, one file per milestone):
 | 12 | `ap040_pipe_l1.v` posted write buffer (port B write side, ahead of BSR/JSR) | `tb_ap040_pipe_l1_wbuf.v` |
 | 13 | BSR (all 3 widths), JSR (An)/(d16,An) -- first real stack push, reusing the write buffer | `tb_ap040_pipe_bsr.v`, `tb_ap040_pipe_jsr.v` |
 | 14 | Exception entry: illegal instruction (vector 4), TRAP #n (vectors 32-47), format $0 (4-word) frame -- first exception-entry sequencer | `tb_ap040_pipe_exc.v` |
+| 15 | Supervisor state: real 16-bit SR, VBR/SFC/DFC/CACR, MOVEC, MOVE to SR, dynamic privilege violation (vector 8), USP/ISP/MSP banking | `tb_ap040_pipe_sup.v` |
 
 Register-direct/immediate/register-indirect(+displacement) only -- no
 indexed/absolute/PC-relative EA modes, no byte/word sizes yet (BSR/JSR now
@@ -587,6 +588,121 @@ its own follow-up milestone, not guessed at here -- see section 6 item 2b.
 Full 16-file `run_pipe_tests.sh` green (14 pipe-core tests + the new
 exception test + the standalone `l1_wbuf` test).
 
+**DONE (milestone 15, 2026-08-27): supervisor state -- real 16-bit SR,
+VBR/SFC/DFC/CACR, MOVEC, MOVE to SR, dynamic privilege violation (vector
+8), and (for the first time) genuine USP/ISP/MSP banking.** The user's
+own framing: audit what supervisor state exists, fill the gaps (VBR, the
+three stack pointers, SFC, DFC, CACR), and prove mode switching and
+privileged-instruction faulting actually work, not just that the
+registers exist.
+
+- **`ccr` (5 bits) became `sr` (16 bits)**, matching `AP040_SR_RESET`'s
+  exact layout (T1/T0/S/M/-/IPL/-/-/-/CCR). `sr_s`/`sr_m` feeding
+  `ap040_pipe_regfile.v`'s A7 bank -- hardwired `1'b1`/`1'b0` since that
+  module was first written -- are finally real bits of live state.
+  `ap040_pipe_regfile.v`'s `aux_we`/`aux_sel`/`aux_wdata` port -- present
+  since that file's first version, never driven until now -- got its
+  first real user, for MOVEC's USP/ISP/MSP targets.
+- **Four new control registers** (VBR/SFC/DFC/CACR) live directly in
+  `ap040_pipe_core.v`, MOVEC-writable/readable. The MMU registers
+  (TC/ITT0/ITT1/DTT0/DTT1/URP/SRP/MMUSR) are explicitly out of scope per
+  the user's own framing -- `ap040_decode.v`'s MOVEC selector validation
+  rejects them as illegal (vector 4), the same treatment any other
+  unrecognized construct gets, not silently accepted or dropped. CACR is
+  a plain, behaviorally inert register (masked `& 32'h8000_8000` for
+  bit-exact readback) -- this substrate's unified L1 has no per-way
+  enable/disable concept to actually gate, the same "diminished capacity"
+  already flagged for CINV/CPUSH in section 5a.
+- **MOVEC's read direction needed no new commit path at all** -- the
+  selected control register's current value is fed straight from
+  `ap040_pipe_core.v` into `ap040_execute.v` (bypassing
+  `ap040_decode.v`/`ap040_ea_calc.v`/`ap040_ea_fetch.v` entirely, since
+  these are live architectural state, not per-instruction pipeline data)
+  and routed through the SAME `combined_result`/`commit_reg` machinery
+  every other GPR-writing instruction already uses.
+- **The privilege check is the pipeline's first genuinely DYNAMIC
+  exception trigger.** Illegal/TRAP are decode-time facts; whether MOVEC/
+  MOVE-to-SR actually FAULTS depends on the live, forwarded S bit, which
+  doesn't exist until `ap040_ea_fetch.v` -- `eac_is_priv` is computed
+  there and folds into the exact same `eac_is_exc`/`exc_pc_field`/
+  `exc_vec_num` machinery illegal/TRAP already built (vector 8, format
+  $0, own-address PC field, go_priv's exact convention).
+- **A real architectural bug found and fixed BEFORE it could hide in an
+  untested corner**: an exception's own frame push must ALWAYS land on a
+  SUPERVISOR stack (ISP, or MSP if M=1), never on whichever bank happens
+  to be currently active -- a privilege violation taken WHILE ALREADY IN
+  USER MODE would otherwise silently push its own exception frame onto
+  USP. Confirmed wrong against `ap040_core.v`'s own S_EXC0/S_EXC1
+  ordering (`sr[13]<=1` commits a full cycle before `dbg_a7` -- itself
+  bank-selected off the now-already-supervisor `sr` -- is read for the
+  stack pointer) before fixing, not assumed. Fixed by having
+  `ap040_ea_fetch.v` read `isp_in`/`msp_in` DIRECTLY (bypassing port B/A7
+  entirely for this one purpose) rather than through whatever bank is
+  currently active -- which, as a side effect, made the earlier
+  `eff_dest_reg` port-B-rerouting mechanism unnecessary and it was
+  removed, a net simplification alongside the fix.
+- **A second real hazard, found by the test actually failing, not by
+  inspection**: `sr_resolved`'s write-through forward (mirroring the
+  regfile's own bypass and CCR's prior version of the same mux) covered
+  "a producer committing THIS cycle," but not "a producer still IN EX,
+  one stage ahead" -- exactly the gap `ex_fwd_*` already exists to close
+  for GPRs, just never needed for SR before now because nothing upstream
+  of EX ever consumed live SR until `ap040_ea_fetch.v`'s privilege check
+  did. A BSR one instruction behind a `MOVE to SR` that had just dropped
+  to user mode read A7 through the STALE, pre-switch (supervisor) bank
+  for exactly one cycle, banking its push onto ISP instead of USP.
+  Diagnosed with a cycle-by-cycle trace (not guessed), fixed by adding
+  `ex_sr_fwd_valid`/`ex_sr_fwd_data` -- SR's own EX-live forward,
+  mirroring `ex_fwd_*`'s shape exactly, now the highest-priority term in
+  `sr_resolved`. Fixing this closed off a genuine combinational-loop risk
+  too: `ap040_execute.v`'s own exception-masking arithmetic used to read
+  a live `sr_in` port fed by `sr_resolved` -- which, once `sr_resolved`
+  itself depends on EX's own forward output, would have closed a loop
+  through EX's own input. Resolved by having `ap040_ea_fetch.v` thread
+  its OWN already-correct, one-cycle-earlier read down as
+  `eaf_sr_snapshot` instead, removing `ap040_execute.v`'s `sr_in` port
+  entirely rather than papering over the loop.
+- **`tb_ap040_pipe_sup.v` chains four phases** (MOVEC read/write for all
+  seven control registers -> MOVE-to-SR drops to user mode -> an
+  ordinary BSR in user mode proves USP banking -> a privileged MOVEC in
+  user mode faults, proving the frame still lands on ISP, untouched USP)
+  through ONE continuous program, deliberately reusing each register's
+  phase-1 source value as an implicit "poison never overwrote me" proof
+  later on (only eight registers exist for four phases' worth of
+  independent checks) rather than needing fresh ones. Two honest
+  testbench-only bugs surfaced and were fixed, not the RTL: a `MOVEQ
+  #$99,D5` marker asserted against zero-extended `$99` instead of the
+  correct sign-extended `$FFFFFF99` (real MOVEQ semantics), and an
+  "SR.S==0" check asserted against the FINAL simulation snapshot even
+  though phase 4's exception legitimately forces S back to 1 by
+  then -- removed in favor of the indirect proof phase 3's successful USP
+  banking already provides.
+- **Mutation testing**: removing `ex_sr_fwd_valid`'s priority term from
+  `sr_resolved` -- caught, reproducing the EXACT original bug (USP off by
+  the ISP-vs-USP arithmetic difference) byte-for-byte. Forcing
+  `exc_sp_bank` to the naive "currently active bank" (`operand_b`)
+  instead of `isp_in`/`msp_in` -- caught (the privilege-violation frame
+  landed on the wrong stack). Removing the `!sr_in[13]` gate from
+  `eac_is_priv` (privilege-violating unconditionally, even in
+  supervisor mode) -- caught with a total cascade, every MOVEC in phase 1
+  faulting instead of succeeding. Removing VBR's selector from
+  `movec_sel_valid` -- caught with the same total-cascade signature,
+  confirming an invalid MOVEC selector's illegal-instruction path is
+  real, not just decoded-and-ignored. All four restored and
+  diff-confirmed clean.
+- **Deliberately NOT built**: `MOVE from SR` and `MOVE An,USP`/`MOVE
+  USP,An` (MOVEC's own selector set already gives read/write access to
+  USP/ISP/MSP, making the dedicated USP opcode redundant for this
+  milestone's goals; SR's value is fully observable via the new `dbg_sr`
+  tap without needing an ISA instruction for it). VBR is now a REAL,
+  settable/readable register, but the exception-entry sequencer still
+  does NOT consult it -- vector fetch still uses the PC_RESET-relative
+  convention milestone 14 established; wiring VBR in is explicitly
+  deferred, not forgotten.
+
+Full 17-file `run_pipe_tests.sh` green (15 pipe-core tests + the new
+supervisor-state test + the standalone `l1_wbuf` test).
+
 ## 5. Verification discipline (keep doing this)
 
 This is what has actually kept the pipeline correct across twelve milestones
@@ -671,24 +787,37 @@ of rewrites; don't relax it for speed:
    equals `PC_RESET`, no real control register yet) + supervisor stack
    frame push, for vector 4 (illegal instruction -- what used to be a
    silent bubble now genuinely traps) and TRAP #n (vectors 32-47, new
-   opcode). See the writeup above section 5. **Still NOT done**: format
-   $2 (the 6-word frame, one extra "instruction address" longword) for
-   **address error on an odd JMP/JSR target** -- `rtl_old`'s S_JMP1/S_JSR1
-   have real, mode-dependent bit-exact quirks (JMP's stacked PC is
-   `pc_i+2` regardless of gather width; JSR's is the target itself, and
-   JSR skips its push entirely rather than attempting one at an odd
-   address) verified against `ap040_core.v` but not yet built here --
-   deliberately split into its own milestone rather than guessed at
-   alongside format $0. Also still deferred: **TRAPcc**, **DBcc's
-   branch-target parity check**, **privilege violation** (needs real
-   supervisor/user mode -- `sr_s`/`sr_m` are still hardwired), **CHK**/
-   **zero-divide** (no such instructions exist yet), **trace**, **RTE**
-   (the return path -- everything above is entry-only so far, verified by
-   reading pushed frame contents directly out of `ap040_pipe_l1.v`'s
-   array, the same style BSR/JSR's own tests already use, not by actually
-   returning), and **bus/access-fault format $7** (needs a real BCU/MMU,
-   explicitly deferred with that milestone per section 5's write-buffer
-   note).
+   opcode). See the writeup above section 5. **DONE (milestone 15):
+   supervisor state** -- real 16-bit SR, VBR/SFC/DFC/CACR, MOVEC, MOVE to
+   SR, and privilege violation (vector 8, format $0, genuinely DYNAMIC --
+   the first exception trigger that isn't a decode-time fact) are all
+   real now, with USP/ISP/MSP banking proven end-to-end (an ordinary BSR
+   in user mode correctly targets USP; an exception taken from user mode
+   still correctly lands on ISP/MSP, never USP -- a real bug caught and
+   fixed before it could hide, see the writeup above section 5). **Still
+   NOT done**: format $2 (the 6-word frame, one extra "instruction
+   address" longword) for **address error on an odd JMP/JSR target** --
+   `rtl_old`'s S_JMP1/S_JSR1 have real, mode-dependent bit-exact quirks
+   (JMP's stacked PC is `pc_i+2` regardless of gather width; JSR's is the
+   target itself, and JSR skips its push entirely rather than attempting
+   one at an odd address) verified against `ap040_core.v` but not yet
+   built here -- deliberately split into its own milestone rather than
+   guessed at alongside format $0. **`MOVE from SR`, `MOVE An,USP`/`MOVE
+   USP,An`** deliberately not built (MOVEC's own selector set already
+   covers USP/ISP/MSP; SR's value is observable via the new `dbg_sr` tap
+   without needing an ISA instruction for it) -- add them if/when
+   something in this repo actually needs the opcodes, not preemptively.
+   **VBR exists but isn't consulted yet** -- vector fetch still uses the
+   PC_RESET-relative convention milestone 14 established; wiring a
+   settable VBR into the actual vector-fetch address is separate,
+   deferred work. Also still deferred: **TRAPcc**, **DBcc's
+   branch-target parity check**, **CHK**/**zero-divide** (no such
+   instructions exist yet), **trace**, **RTE** (the return path --
+   everything above is entry-only so far, verified by reading pushed
+   frame contents directly out of `ap040_pipe_l1.v`'s array, the same
+   style BSR/JSR's own tests already use, not by actually returning), and
+   **bus/access-fault format $7** (needs a real BCU/MMU, explicitly
+   deferred with that milestone per section 5's write-buffer note).
 3. **Byte/word-sized ALU ops and MOVE** (current pipeline is Long-only
    throughout `ap040_pipe_alu.v`'s size port is already there and unused).
 4. **MMU and cache integration**, once enough of the integer ISA exists that
