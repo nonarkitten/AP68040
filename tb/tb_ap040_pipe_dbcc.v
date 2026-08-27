@@ -96,17 +96,17 @@ integer errors = 0;
 
 initial begin
 	#1;
-	dut.u_if.rom[1]  = 16'h7002;   // MOVEQ #2,D0
-	dut.u_if.rom[2]  = 16'h51C8;   // DBF D0,<ext>
-	dut.u_if.rom[3]  = 16'hFFFE;   // ext: disp=-2, target=rom[2] (self)
-	dut.u_if.rom[4]  = 16'h7607;   // MOVEQ #7,D3 (loop exit, must run once)
+	dut.u_l1.mem[1]  = 16'h7002;   // MOVEQ #2,D0
+	dut.u_l1.mem[2]  = 16'h51C8;   // DBF D0,<ext>
+	dut.u_l1.mem[3]  = 16'hFFFE;   // ext: disp=-2, target=rom[2] (self)
+	dut.u_l1.mem[4]  = 16'h7607;   // MOVEQ #7,D3 (loop exit, must run once)
 
-	dut.u_if.rom[5]  = 16'h7209;   // MOVEQ #9,D1
-	dut.u_if.rom[6]  = 16'h50C9;   // DBT D1,<ext>
-	dut.u_if.rom[7]  = 16'h0006;   // ext: disp=+6, target=rom[10] (poison, never taken)
-	dut.u_if.rom[8]  = 16'h7405;   // MOVEQ #5,D2 (fall-through, must run)
-	dut.u_if.rom[9]  = 16'h6002;   // BRA +2 words, jumps over rom[10]
-	dut.u_if.rom[10] = 16'h724D;   // MOVEQ #77,D1 (poison, must not run)
+	dut.u_l1.mem[5]  = 16'h7209;   // MOVEQ #9,D1
+	dut.u_l1.mem[6]  = 16'h50C9;   // DBT D1,<ext>
+	dut.u_l1.mem[7]  = 16'h0006;   // ext: disp=+6, target=rom[10] (poison, never taken)
+	dut.u_l1.mem[8]  = 16'h7405;   // MOVEQ #5,D2 (fall-through, must run)
+	dut.u_l1.mem[9]  = 16'h6002;   // BRA +2 words, jumps over rom[10]
+	dut.u_l1.mem[10] = 16'h724D;   // MOVEQ #77,D1 (poison, must not run)
 end
 
 // D0's CCR is unaffected throughout: neither MOVEQ #2 nor DBF/DBT touch it

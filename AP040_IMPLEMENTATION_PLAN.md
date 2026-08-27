@@ -95,10 +95,106 @@ Completed milestones (`tb/run_pipe_tests.sh`, one file per milestone):
 | 6 | Scc.B Dn, folder independence (`rtl/` no longer touches `rtl_old/`) | `tb_ap040_pipe_scc.v` |
 | 7 | Bcc.W/Bcc.L, multi-word decode gather, `id_next_pc` | `tb_ap040_pipe_bccw.v`, `tb_ap040_pipe_bccl.v` |
 | 8 | DBcc Dn,\<label\>, dynamic (runtime-conditioned) register write | `tb_ap040_pipe_dbcc.v` |
+| 9a | Unified L1 (`ap040_pipe_l1.v`) replaces IF's inline ROM; port B reserved for data | all of the above, unchanged behavior |
+| 9b | MOVE.L (An),Dn -- first memory read, first genuine pipeline stall | `tb_ap040_pipe_move_mem.v` |
 
-Everything implemented so far is register-direct/immediate only -- **no
-memory-referencing instruction exists yet**. That's the single biggest gap;
-see section 6.
+Register-direct/immediate/register-indirect only -- no arithmetic-EA modes
+((d16,An), indexed, absolute, PC-relative), no byte/word sizes, no writes to
+memory yet. See section 6.
+
+## 5a. The unified-L1 decision (2026-08-27)
+
+Went with a single dual-port memory shared between instruction fetch and
+(eventually) data, instead of separate I/D storage or a private flat-memory
+stub per testbench, on the reasoning below -- see `ap040_pipe_l1.v`'s header
+for the implementation-level detail.
+
+- **Coherency for free.** A write through the data port is visible to a
+  later instruction-fetch read with no explicit invalidation, just from both
+  ports addressing the same array -- unlike a split Harvard I/D cache (what
+  `rtl_old/ap040_cache.v` and the real 68040 both are), which needs CINV/
+  CPUSH to move data from the D side to the I side. This is a real,
+  intentional deviation from the real chip's cache architecture, not an
+  oversight: `rtl_old` already IS the split-cache reference if bit-exact
+  cache behavior is ever needed, and this repo has no backing store of its
+  own to make a real miss/fill/replacement policy meaningful yet (no SDRAM/
+  DDR model -- unlike the Minimig-AGA tree this core was extracted from).
+- **Consequence, not free:** CINV/CPUSH can only ever be decoded/accepted as
+  no-ops on this substrate -- there is no staleness for them to fix, so
+  their actual observable effect (stale-until-flush) is untestable here.
+  `rtl_old`'s `t_cache` suite is where that semantic is actually exercised;
+  don't expect the pipeline to ever reproduce it against this L1.
+- **CACR's independent I/D enable bits** (the real 68040 lets software
+  disable the data cache while leaving the instruction cache on, or vice
+  versa) are not a blocker: they become an access-side gate ("does this
+  read consult the array or bypass it") over the one shared array, not a
+  reason to keep two cache instances. Not implemented yet -- there's no
+  CACR in the pipeline at all -- but the port shape doesn't foreclose it.
+- **Timing: this was a drop-in, not a stall-infrastructure change**, and
+  that was verified, not assumed: `ap040_inst_fetch.v`'s old inline ROM read
+  was already registered (1-cycle address-to-data latency, same as a real
+  BRAM), so lifting the array out to `ap040_pipe_l1.v` and having IF drive
+  its address combinationally reproduces the exact same timing. All 9
+  existing pipe tests pass unmodified (only their hierarchical preload path
+  changed, `dut.u_if.rom[N]` -> `dut.u_l1.mem[N]`, since the storage moved).
+- **Decided (2026-08-27): registered + stalled**, not combinational. Port
+  B's read matches `ap040_pipe_l1.v`'s own `q_b <= mem[address_b]` (and
+  IF's port A precedent), not `ap040_pipe_regfile.v`'s zero-added-latency
+  ports. Chosen over combinational specifically to avoid building a second
+  timing model that would need redoing once a real cache-miss path exists
+  later.
+
+**DONE (milestone 9b, same day): MOVE.L (An),Dn.** Port B is 32-bit
+(read/write, both adjacent 16-bit words in one access -- see
+`ap040_pipe_l1.v`'s header for why: this core's internal memory interface
+is meant to be 32-bit-native per section 1, with 16-bit-bus splitting left
+to a future host adapter, not built into the core). `ap040_ea_fetch.v`
+gained a two-state `mem_issue`/`mem_complete` FSM that needed no new
+register-forwarding logic at all -- An's value already resolves through the
+EXACT SAME `operand_a` priority mux (regfile read + EX-forward) every
+register-direct source operand has used since milestone 2, because decode
+sets `eac_src_reg` to An's own unified regfile index (8+n) rather than
+inventing a separate address-register field. The one-cycle stall reuses the
+existing freeze-on-`stall_in` behavior every stage has had since milestone 1
+(asserting `eaf_stall` for exactly the issuing cycle freezes EA-calc's
+output, so it still describes the same instruction on the completing cycle)
+-- no separate pending-instruction latch needed in EA-fetch.
+
+Two real bugs surfaced during development, worth recording:
+1. **A genuine RTL bug**, caught by the test before it shipped: the first
+   draft had EA-fetch address L1 port B as an ABSOLUTE byte address
+   (`operand_a >> 1`), while `ap040_inst_fetch.v` addresses port A
+   PC_RESET-RELATIVE (`(fetch_pc - PC_RESET) >> 1`) -- two different
+   conventions into the SAME shared array silently breaks the entire point
+   of unifying it. Fixed by giving `ap040_ea_fetch.v` the same `PC_RESET`
+   parameter and using the identical convention; confirmed the mismatch is
+   real and now caught by mutation-testing it back in (reproduces the exact
+   `4e714e71` symptom the real bug produced).
+2. **A test-methodology bug, not RTL**: the test seeds `A0` via a
+   hierarchical poke (`dut.u_regfile.areg[0] = ...`, no MOVEA/LEA yet to
+   load it architecturally) placed immediately after `nreset = 1`. A classic
+   blocking/non-blocking race: `ap040_pipe_regfile.v`'s own reset block
+   samples `nreset` in the SAME edge's active region (still 0) and schedules
+   `areg[i] <= 0` as a non-blocking update, which then commits AFTER the
+   poke's blocking assignment in the same timestep, silently overwriting it.
+   `ap040_pipe_l1.v`'s ROM pokes never hit this because `mem[]` has no reset
+   logic at all. Fixed by waiting one more clock edge past `nreset = 1`
+   before poking. General lesson for any FUTURE test that pokes a resettable
+   register (not memory): the reset edge itself is not a safe time to poke
+   across.
+
+Three independent mutations confirmed the mechanism is actually exercised,
+not passing by coincidence: dropping `mem_issue` from `eaf_stall` (EA-calc
+advances early -> the memory value lands in the WRONG register, D1 instead
+of D0, not just a wrong value in the right one), swapping the L1 word order
+(byte-swapped-at-the-word-level result), and the PC_RESET-omission mutation
+above.
+
+Not exercised by this test, explicitly deferred rather than assumed: EX-
+forwarding INTO the address computation (a producer writing An immediately
+before this instruction reads it) -- mechanically covered by the reused
+`operand_a` mux, but nothing tests it yet since MOVEA/LEA don't exist to
+generate that producer. Revisit once they do.
 
 ## 5. Verification discipline (keep doing this)
 
@@ -131,15 +227,14 @@ of rewrites; don't relax it for speed:
 
 ## 6. Remaining scope, roughly in dependency order
 
-1. **First memory-referencing instruction.** The real gap. `ap040_ea_fetch.v`
-   currently only ever resolves register-direct/immediate operands (see its
-   header). Needs: a memory port on the pipeline (start with a flat
-   synchronous test memory, like `rtl_old`'s own testbenches use, before
-   worrying about the real 16-bit adapter), an EA-calc stage that actually
-   computes an address (`(An)` register-indirect is the natural first mode),
-   and a stall path when the memory response isn't ready same-cycle. Suggest
-   `MOVE.L (An),Dn` as the first target -- simplest addressing mode, reuses
-   the existing MOVE.L decode/ALU path, only adds the fetch itself.
+1. **DONE (milestone 9b): first memory-referencing instruction**,
+   `MOVE.L (An),Dn` -- see section 5a. Next EA-mode candidates, in
+   increasing order of new machinery needed: `(An)+`/`-(An)` (An update --
+   needs a real WRITE to the regfile from EA-calc/EA-fetch, not just a
+   read, and a decision on WHEN the update commits relative to a fault),
+   `(d16,An)` (the first EA-calc arithmetic -- a second extension word,
+   reusing the multi-word gather machinery `ap040_decode.v` already has for
+   Bcc/DBcc), then indexed/absolute/PC-relative.
 2. **BSR / JMP / JSR.** BSR needs the pipeline's first real memory *write*
    (stack push) and RTS needs a read; JMP/JSR need real effective-address
    modes, not just displacement math. Natural follow-on once (1) lands.

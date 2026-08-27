@@ -69,9 +69,9 @@ integer errors = 0;
 // after ap040_inst_fetch.v's own t=0 fill (standard Verilog idiom).
 initial begin
 	#1;
-	dut.u_if.rom[1] = 16'h7003;   // MOVEQ #3,D0
-	dut.u_if.rom[2] = 16'h7204;   // MOVEQ #4,D1
-	dut.u_if.rom[3] = 16'hD280;   // ADD.L D0,D1
+	dut.u_l1.mem[1] = 16'h7003;   // MOVEQ #3,D0
+	dut.u_l1.mem[2] = 16'h7204;   // MOVEQ #4,D1
+	dut.u_l1.mem[3] = 16'hD280;   // ADD.L D0,D1
 end
 
 initial begin

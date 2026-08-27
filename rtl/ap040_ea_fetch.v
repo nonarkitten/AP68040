@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 8: DBcc)            //
+// AP040_PIPE - MC68040-style pipelined core (milestone 9b: MOVE.L (An),Dn) //
 //                                                                          //
 // ap040_ea_fetch.v - EA-fetch stage                                       //
 //                                                                          //
@@ -54,12 +54,55 @@
 // must be discarded. Same shape as stall_in but forces a bubble instead     //
 // of holding.                                                              //
 //                                                                          //
-// Memory operands (a real dcache fetch) are still not implemented -- this  //
-// stage only ever resolves register-direct operands or an immediate so     //
-// far, per the notes in AP040_IMPLEMENTATION_PLAN.md section 19 P4.        //
+// MOVE.L (An),Dn (milestone 9b, new) is this pipeline's first memory read,   //
+// and its first genuine stall. The address itself needs NO new logic: An's  //
+// value is already what `operand_a` resolves to (decode set eac_src_reg to   //
+// An's unified regfile index, see ap040_decode.v's header) -- the SAME       //
+// priority mux, with the SAME EX-forward source, that every register-direct  //
+// operand has used since milestone 2. What's new is turning that value into  //
+// an actual ap040_pipe_l1.v port-B access:                                   //
+//                                                                            //
+//   mem_issue    (eac_valid && eac_is_mem_src && !mem_pending) -- the cycle  //
+//                this stage first sees an unserviced memory instruction.     //
+//                l1_addr_b is driven combinationally off operand_a THIS      //
+//                cycle (ap040_pipe_l1.v registers l1_q_b from it, valid      //
+//                next cycle); eaf_valid goes to 0 (nothing for EX yet); and  //
+//                eaf_stall's mem_issue term freezes ap040_ea_calc.v's        //
+//                OUTPUT for exactly this one cycle -- not a separate pending-//
+//                instruction latch in THIS stage, just reusing the stall     //
+//                chain's existing freeze-on-stall_in behavior (every stage    //
+//                has had it since milestone 1). That's why eac_* is         //
+//                guaranteed to still describe the SAME instruction next      //
+//                cycle with no extra bookkeeping here.                       //
+//   mem_complete (mem_pending, i.e. the cycle after issuing) -- eac_* is      //
+//                still frozen on this same instruction, l1_q_b now holds the  //
+//                fetched longword. Finishes exactly like the normal path      //
+//                below, except eaf_operand_a comes from l1_q_b instead of     //
+//                operand_a/regfile/forwarding. eaf_stall drops (mem_issue is  //
+//                false once mem_pending is set), so ap040_ea_calc.v is free   //
+//                to advance a NEW instruction into its output starting THIS   //
+//                cycle -- the memory latency is hidden from whatever comes    //
+//                next, not paid twice.                                       //
+//                                                                            //
+// L1 addressing: ap040_pipe_l1.v is addressed PC_RESET-relative (see          //
+// ap040_inst_fetch.v's header) -- PC_RESET is the L1 window's BASE address,   //
+// not "where execution starts" in isolation, and both ports must agree on    //
+// it or the "unified" memory silently stops being unified. This stage takes  //
+// the SAME PC_RESET parameter ap040_inst_fetch.v does (ap040_pipe_core.v     //
+// passes the identical value to both) rather than assuming address 0.        //
+//                                                                            //
+// flush: when ap040_execute.v detects a mispredicted branch, everything     //
+// speculatively fetched behind it -- including whatever is sitting here -- //
+// must be discarded. An outstanding L1 request (mem_pending) is simply       //
+// abandoned, not unwound -- a read has no side effect, so its eventual        //
+// l1_q_b is just never consumed once mem_pending clears.                     //
 //--------------------------------------------------------------------------//
 
 module ap040_ea_fetch
+#(
+	parameter [31:0] PC_RESET = 32'h0000_0400,   // must match ap040_inst_fetch.v's -- see header
+	parameter         L1_AW    = 12               // must match the ap040_pipe_l1.v instance's AW
+)
 (
 	input             clk,
 	input             nreset,
@@ -80,6 +123,7 @@ module ap040_ea_fetch
 	input             eac_is_branch,
 	input             eac_is_scc,
 	input             eac_is_dbcc,
+	input             eac_is_mem_src,
 	input       [3:0] eac_cond,
 
 	// regfile operand read ports (driven combinationally by this stage;
@@ -95,7 +139,11 @@ module ap040_ea_fetch
 	input       [3:0] ex_fwd_dest,
 	input      [31:0] ex_fwd_data,
 
-	output            eaf_stall,  // to EA-calc: no local stall of its own yet
+	// ap040_pipe_l1.v port B -- read-only from here (see header)
+	output [L1_AW-1:0] l1_addr_b,
+	input        [31:0] l1_q_b,
+
+	output            eaf_stall,  // to EA-calc
 
 	output reg        eaf_valid,
 	output reg [31:0] eaf_pc,
@@ -112,7 +160,14 @@ module ap040_ea_fetch
 	output reg  [3:0] eaf_cond
 );
 
-assign eaf_stall = stall_in;
+reg mem_pending;   // an L1 port-B request is in flight for the CURRENT eac_*
+                    // instruction; its result becomes valid next cycle -- see
+                    // header.
+
+wire mem_issue    = eac_valid && eac_is_mem_src && !mem_pending;
+wire mem_complete = mem_pending;
+
+assign eaf_stall = stall_in || mem_issue;
 assign raddr_a    = eac_src_reg;
 assign raddr_b    = eac_dest_reg;
 
@@ -123,6 +178,8 @@ wire fwd_b_from_ex = ex_fwd_valid && (ex_fwd_dest == eac_dest_reg);
 // regfile's own (possibly write-through-bypassed) read. eac_src_a_is_imm
 // and fwd_a_from_ex are mutually exclusive in practice (MOVEQ never has a
 // meaningful eac_src_reg), so this is one priority mux, not two stacked.
+// For a memory-source instruction this IS the effective address (An's
+// value, decode having set eac_src_reg to An's unified index) -- see header.
 wire [31:0] operand_a = eac_src_a_is_imm ? eac_imm :
                          fwd_a_from_ex   ? ex_fwd_data :
                                            rdata_a;
@@ -130,6 +187,12 @@ wire [31:0] operand_a = eac_src_a_is_imm ? eac_imm :
 // Port B has no immediate case -- it's always "the destination register's
 // current value" -- so it's a flat 2-way select.
 wire [31:0] operand_b = fwd_b_from_ex ? ex_fwd_data : rdata_b;
+
+// Driven unconditionally, same "compute always, gate consumption" precedent
+// as raddr_b -- harmless when eac_is_mem_src is false, nothing reads l1_q_b
+// that cycle. PC_RESET-relative to match ap040_inst_fetch.v's own L1
+// addressing -- see header.
+assign l1_addr_b = (operand_a - PC_RESET) >> 1;
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -146,23 +209,45 @@ always @(posedge clk) begin
 		eaf_is_scc     <= 1'b0;
 		eaf_is_dbcc    <= 1'b0;
 		eaf_cond       <= 4'h0;
+		mem_pending    <= 1'b0;
 	end else if (ce) begin
 		if (flush) begin
-			eaf_valid <= 1'b0;
+			eaf_valid   <= 1'b0;
+			mem_pending <= 1'b0;
 		end else if (!stall_in) begin
-			eaf_valid      <= eac_valid;
-			eaf_pc         <= eac_pc;
-			eaf_next_pc    <= eac_next_pc;
-			eaf_dest_reg   <= eac_dest_reg;
-			eaf_operand_a  <= operand_a;
-			eaf_operand_b  <= operand_b;
-			eaf_alu_op     <= eac_alu_op;
-			eaf_writes_reg <= eac_writes_reg;
-			eaf_writes_ccr <= eac_writes_ccr;
-			eaf_is_branch  <= eac_is_branch;
-			eaf_is_scc     <= eac_is_scc;
-			eaf_is_dbcc    <= eac_is_dbcc;
-			eaf_cond       <= eac_cond;
+			if (mem_issue) begin
+				eaf_valid   <= 1'b0;
+				mem_pending <= 1'b1;
+			end else if (mem_complete) begin
+				eaf_valid      <= eac_valid;
+				eaf_pc         <= eac_pc;
+				eaf_next_pc    <= eac_next_pc;
+				eaf_dest_reg   <= eac_dest_reg;
+				eaf_operand_a  <= l1_q_b;
+				eaf_operand_b  <= operand_b;
+				eaf_alu_op     <= eac_alu_op;
+				eaf_writes_reg <= eac_writes_reg;
+				eaf_writes_ccr <= eac_writes_ccr;
+				eaf_is_branch  <= eac_is_branch;
+				eaf_is_scc     <= eac_is_scc;
+				eaf_is_dbcc    <= eac_is_dbcc;
+				eaf_cond       <= eac_cond;
+				mem_pending    <= 1'b0;
+			end else begin
+				eaf_valid      <= eac_valid;
+				eaf_pc         <= eac_pc;
+				eaf_next_pc    <= eac_next_pc;
+				eaf_dest_reg   <= eac_dest_reg;
+				eaf_operand_a  <= operand_a;
+				eaf_operand_b  <= operand_b;
+				eaf_alu_op     <= eac_alu_op;
+				eaf_writes_reg <= eac_writes_reg;
+				eaf_writes_ccr <= eac_writes_ccr;
+				eaf_is_branch  <= eac_is_branch;
+				eaf_is_scc     <= eac_is_scc;
+				eaf_is_dbcc    <= eac_is_dbcc;
+				eaf_cond       <= eac_cond;
+			end
 		end
 	end
 end

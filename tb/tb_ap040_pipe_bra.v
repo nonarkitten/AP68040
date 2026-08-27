@@ -65,9 +65,9 @@ integer errors = 0;
 // after ap040_inst_fetch.v's own t=0 fill (standard Verilog idiom).
 initial begin
 	#1;
-	dut.u_if.rom[1] = 16'h6002;   // BRA +2
-	dut.u_if.rom[2] = 16'h7263;   // MOVEQ #99,D1 (poison)
-	dut.u_if.rom[3] = 16'h7005;   // MOVEQ #5,D0  (target)
+	dut.u_l1.mem[1] = 16'h6002;   // BRA +2
+	dut.u_l1.mem[2] = 16'h7263;   // MOVEQ #99,D1 (poison)
+	dut.u_l1.mem[3] = 16'h7005;   // MOVEQ #5,D0  (target)
 end
 
 initial begin

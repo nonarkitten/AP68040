@@ -17,9 +17,10 @@ mkdir -p "$WORK"
 
 SRC="$RTL/ap040_pipe_core.v $RTL/ap040_inst_fetch.v $RTL/ap040_decode.v \
      $RTL/ap040_ea_calc.v $RTL/ap040_ea_fetch.v $RTL/ap040_execute.v \
-     $RTL/ap040_writeback.v $RTL/ap040_pipe_alu.v $RTL/ap040_pipe_regfile.v"
+     $RTL/ap040_writeback.v $RTL/ap040_pipe_alu.v $RTL/ap040_pipe_regfile.v \
+     $RTL/ap040_pipe_l1.v"
 
-TESTS="nop moveq add bra bcc bccw bccl scc dbcc"
+TESTS="nop moveq add bra bcc bccw bccl scc dbcc move_mem"
 
 echo "== compiling pipe benches =="
 for t in $TESTS; do

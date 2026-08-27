@@ -105,7 +105,8 @@
 module ap040_pipe_core
 #(
 	parameter [31:0] PC_RESET   = 32'h0000_0400,
-	parameter         PROG_WORDS = 10
+	parameter         PROG_WORDS = 10,
+	parameter         L1_AW      = 12   // ap040_pipe_l1.v size: 2**L1_AW words
 )
 (
 	input  clk,
@@ -131,7 +132,7 @@ wire  [3:0] id_dest_reg, id_src_reg;
 wire [31:0] id_imm;
 wire  [5:0] id_alu_op;
 wire        id_src_a_is_imm, id_writes_reg, id_writes_ccr;
-wire        id_is_branch, id_is_scc, id_is_dbcc;
+wire        id_is_branch, id_is_scc, id_is_dbcc, id_is_mem_src;
 wire  [3:0] id_cond;
 // id_unimpl: decode's "opcode not recognized" bit. Not consumed past decode
 // yet -- nothing traps on it (writes_reg=0 already makes an unrecognized
@@ -146,7 +147,7 @@ wire  [3:0] eac_dest_reg, eac_src_reg;
 wire [31:0] eac_imm;
 wire  [5:0] eac_alu_op;
 wire        eac_src_a_is_imm, eac_writes_reg, eac_writes_ccr;
-wire        eac_is_branch, eac_is_scc, eac_is_dbcc;
+wire        eac_is_branch, eac_is_scc, eac_is_dbcc, eac_is_mem_src;
 wire  [3:0] eac_cond;
 
 wire        eaf_valid; wire [31:0] eaf_pc; wire [31:0] eaf_next_pc;
@@ -277,9 +278,37 @@ ap040_pipe_regfile u_regfile
 // Stages
 //---------------------------------------------------------------------------
 
+// Unified L1. Port A is IF's (milestone 9a). Port B is EA-fetch's data
+// read (milestone 9b, new) -- write side (data_b/wren_b) still tied off:
+// nothing writes memory yet, reserved for a future store instruction the
+// same "reserved, not speculative" way raddr_b was until Scc needed it.
+wire [L1_AW-1:0] l1_addr_a;
+wire      [15:0] l1_rdata_a;
+wire [L1_AW-1:0] l1_addr_b;
+wire       [31:0] l1_q_b;
+
+ap040_pipe_l1 #(
+	.AW(L1_AW),
+	.DW(16)
+) u_l1
+(
+	.clock     (clk),
+
+	.address_a (l1_addr_a),
+	.data_a    (16'h0),
+	.wren_a    (1'b0),
+	.q_a       (l1_rdata_a),
+
+	.address_b (l1_addr_b),
+	.data_b    (32'h0),
+	.wren_b    (1'b0),
+	.q_b       (l1_q_b)
+);
+
 ap040_inst_fetch #(
 	.PC_RESET  (PC_RESET),
-	.PROG_WORDS(PROG_WORDS)
+	.PROG_WORDS(PROG_WORDS),
+	.L1_AW     (L1_AW)
 ) u_if
 (
 	.clk       (clk),
@@ -289,6 +318,9 @@ ap040_inst_fetch #(
 
 	.redirect_valid (final_redirect_valid),
 	.redirect_pc    (final_redirect_pc),
+
+	.l1_addr_a  (l1_addr_a),
+	.l1_rdata_a (l1_rdata_a),
 
 	.if_valid  (if_valid),
 	.if_pc     (if_pc),
@@ -325,6 +357,7 @@ ap040_decode u_id
 	.id_is_branch    (id_is_branch),
 	.id_is_scc       (id_is_scc),
 	.id_is_dbcc      (id_is_dbcc),
+	.id_is_mem_src   (id_is_mem_src),
 	.id_cond         (id_cond),
 	.id_unimpl       (id_unimpl)
 );
@@ -350,6 +383,7 @@ ap040_ea_calc u_eac
 	.id_is_branch     (id_is_branch),
 	.id_is_scc        (id_is_scc),
 	.id_is_dbcc       (id_is_dbcc),
+	.id_is_mem_src    (id_is_mem_src),
 	.id_cond          (id_cond),
 
 	.ea_stall         (ea_stall),
@@ -367,10 +401,14 @@ ap040_ea_calc u_eac
 	.eac_is_branch    (eac_is_branch),
 	.eac_is_scc       (eac_is_scc),
 	.eac_is_dbcc      (eac_is_dbcc),
+	.eac_is_mem_src   (eac_is_mem_src),
 	.eac_cond         (eac_cond)
 );
 
-ap040_ea_fetch u_eaf
+ap040_ea_fetch #(
+	.PC_RESET (PC_RESET),
+	.L1_AW    (L1_AW)
+) u_eaf
 (
 	.clk              (clk),
 	.nreset           (nreset),
@@ -391,6 +429,7 @@ ap040_ea_fetch u_eaf
 	.eac_is_branch    (eac_is_branch),
 	.eac_is_scc       (eac_is_scc),
 	.eac_is_dbcc      (eac_is_dbcc),
+	.eac_is_mem_src   (eac_is_mem_src),
 	.eac_cond         (eac_cond),
 
 	.raddr_a          (raddr_a),
@@ -401,6 +440,9 @@ ap040_ea_fetch u_eaf
 	.ex_fwd_valid     (ex_fwd_valid),
 	.ex_fwd_dest      (ex_fwd_dest),
 	.ex_fwd_data      (ex_fwd_data),
+
+	.l1_addr_b        (l1_addr_b),
+	.l1_q_b           (l1_q_b),
 
 	.eaf_stall        (eaf_stall),
 

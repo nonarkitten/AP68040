@@ -101,22 +101,22 @@ integer errors = 0;
 
 initial begin
 	#1;
-	dut.u_if.rom[1]  = 16'h7000;   // MOVEQ #0,D0
-	dut.u_if.rom[2]  = 16'h67ff;   // BEQ.L <ext,ext> (correctly taken)
-	dut.u_if.rom[3]  = 16'h0000;   // ext hi
-	dut.u_if.rom[4]  = 16'h0006;   // ext lo: disp=+6, target=rom[6]
-	dut.u_if.rom[5]  = 16'h7263;   // MOVEQ #99,D1 (poison, must not run)
-	dut.u_if.rom[6]  = 16'h7405;   // MOVEQ #5,D2  (target, must run)
+	dut.u_l1.mem[1]  = 16'h7000;   // MOVEQ #0,D0
+	dut.u_l1.mem[2]  = 16'h67ff;   // BEQ.L <ext,ext> (correctly taken)
+	dut.u_l1.mem[3]  = 16'h0000;   // ext hi
+	dut.u_l1.mem[4]  = 16'h0006;   // ext lo: disp=+6, target=rom[6]
+	dut.u_l1.mem[5]  = 16'h7263;   // MOVEQ #99,D1 (poison, must not run)
+	dut.u_l1.mem[6]  = 16'h7405;   // MOVEQ #5,D2  (target, must run)
 
-	dut.u_if.rom[7]  = 16'h7001;   // MOVEQ #1,D0
-	dut.u_if.rom[8]  = 16'h67ff;   // BEQ.L <ext,ext> (mispredicted -- not taken)
-	dut.u_if.rom[9]  = 16'h72AA;   // discarded disp value / poison opcode if
+	dut.u_l1.mem[7]  = 16'h7001;   // MOVEQ #1,D0
+	dut.u_l1.mem[8]  = 16'h67ff;   // BEQ.L <ext,ext> (mispredicted -- not taken)
+	dut.u_l1.mem[9]  = 16'h72AA;   // discarded disp value / poison opcode if
 	                                // a stale recovery wrongly lands here --
 	                                // see file header
-	dut.u_if.rom[10] = 16'h0008;   // discarded regardless
-	dut.u_if.rom[11] = 16'h7607;   // MOVEQ #7,D3  (fall-through, must run)
-	dut.u_if.rom[12] = 16'h6002;   // BRA +2 words, jumps over rom[13]
-	dut.u_if.rom[13] = 16'h7658;   // MOVEQ #88,D3 (wrong taken target, must not run)
+	dut.u_l1.mem[10] = 16'h0008;   // discarded regardless
+	dut.u_l1.mem[11] = 16'h7607;   // MOVEQ #7,D3  (fall-through, must run)
+	dut.u_l1.mem[12] = 16'h6002;   // BRA +2 words, jumps over rom[13]
+	dut.u_l1.mem[13] = 16'h7658;   // MOVEQ #88,D3 (wrong taken target, must not run)
 end
 
 initial begin

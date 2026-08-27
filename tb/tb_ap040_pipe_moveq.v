@@ -77,10 +77,10 @@ integer cycle  = 0;
 // simulation time advances).
 initial begin
 	#1;
-	dut.u_if.rom[1] = 16'h7005;   // MOVEQ #5,D0
-	dut.u_if.rom[2] = 16'h2200;   // MOVE.L D0,D1
-	dut.u_if.rom[3] = 16'h70FF;   // MOVEQ #-1,D0
-	dut.u_if.rom[5] = 16'h2400;   // MOVE.L D0,D2
+	dut.u_l1.mem[1] = 16'h7005;   // MOVEQ #5,D0
+	dut.u_l1.mem[2] = 16'h2200;   // MOVE.L D0,D1
+	dut.u_l1.mem[3] = 16'h70FF;   // MOVEQ #-1,D0
+	dut.u_l1.mem[5] = 16'h2400;   // MOVE.L D0,D2
 end
 
 always @(posedge clk) if (nreset && ce) cycle = cycle + 1;

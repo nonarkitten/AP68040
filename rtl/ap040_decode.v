@@ -155,6 +155,7 @@ module ap040_decode
 	output reg        id_is_branch,
 	output reg        id_is_scc,
 	output reg        id_is_dbcc,
+	output reg        id_is_mem_src,
 	output reg  [3:0] id_cond,
 	output reg        id_unimpl
 );
@@ -214,6 +215,26 @@ wire is_scc_rr = (if_opcode[15:12] == 4'b0101) && (if_opcode[7:6] == 2'b11) &&
 wire is_dbcc = (if_opcode[15:12] == 4'b0101) && (if_opcode[7:6] == 2'b11) &&
                (if_opcode[5:3]  == 3'b001);
 
+// MOVE.L (An),Dn: 0010 DDD 000 010 aaa (DDD = dest Dn at ir[11:9], aaa =
+// source An at ir[2:0]). ir[15:12]==0010 alone already selects size=Long
+// within the MOVE class (ir[15:14]=00 is fixed for MOVE, ir[13:12]=10=Long
+// is baked into 4'b0010 -- no separate size check needed, unlike
+// is_move_rr's raw-'10' note above). Verified against ap040_core.v's own
+// MOVE decode (ap040_core.v:5021-5052): d_op8_6==000 selects DK_REG
+// (register-direct dest) there, d_mode==010 selects its SK_MEM/(An) source
+// -- rtl_old routes (An) through its fully general src_mode_r/src_rn_r EA
+// machinery, which covers every addressing mode uniformly. This decoder
+// special-cases JUST register-indirect for now, since ITS effective address
+// needs no arithmetic at all: EA = An's value, resolved through the exact
+// same regfile-port-A / EX-forward path register-direct source operands
+// already use (id_src_reg = An's UNIFIED index, 8+n, same 4-bit space
+// ap040_pipe_regfile.v already uses for A0-A6) -- see ap040_ea_fetch.v's
+// header for the mechanism that turns that resolved value into an actual
+// memory access rather than an ALU operand.
+wire is_move_mem_l = (if_opcode[15:12] == 4'b0010) &&
+                      (if_opcode[8:6]  == 3'b000) &&
+                      (if_opcode[5:3]  == 3'b010);
+
 wire is_nop = (if_opcode == `AP040_OP_NOP);
 
 // Gather state -- see header comment. 0 = idle/normal decode cycle;
@@ -267,6 +288,7 @@ always @(posedge clk) begin
 		id_is_branch    <= 1'b0;
 		id_is_scc       <= 1'b0;
 		id_is_dbcc      <= 1'b0;
+		id_is_mem_src   <= 1'b0;
 		id_cond         <= 4'h0;
 		id_unimpl       <= 1'b0;
 		ext_pending     <= 2'd0;
@@ -299,6 +321,7 @@ always @(posedge clk) begin
 					id_is_branch    <= !held_is_dbcc;
 					id_is_scc       <= 1'b0;
 					id_is_dbcc      <= held_is_dbcc;
+					id_is_mem_src   <= 1'b0;
 					id_cond         <= held_cond;
 					id_unimpl       <= 1'b0;
 					ext_pending     <= 2'd0;
@@ -322,17 +345,25 @@ always @(posedge clk) begin
 				id_pc           <= if_pc;
 				id_next_pc      <= if_pc + 32'd2;
 				id_dest_reg     <= is_scc_rr ? {1'b0, d_rn} : {1'b0, d_reg9};
-				id_src_reg      <= {1'b0, d_rn};
+				// is_move_mem_l's src_reg is An, not Dn -- the unified index's
+				// top bit (8+n vs 0+n) is the ONLY thing that distinguishes
+				// "read this register's value as an operand" (every other
+				// instruction so far) from "read this register's value as an
+				// ADDRESS" here; ap040_ea_fetch.v's existing operand_a mux
+				// (regfile read + EX-forward) doesn't need to know the
+				// difference, it just resolves whichever register this is.
+				id_src_reg      <= is_move_mem_l ? {1'b1, d_rn} : {1'b0, d_rn};
 				id_imm          <= {{24{if_opcode[7]}}, if_opcode[7:0]};
 				id_alu_op       <= is_add_rr ? `AP040_ALU_ADD : `AP040_ALU_MOVE;
 				id_src_a_is_imm <= if_valid && is_moveq;
-				id_writes_reg   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_scc_rr);
-				id_writes_ccr   <= if_valid && (is_moveq || is_move_rr || is_add_rr);
+				id_writes_reg   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_scc_rr || is_move_mem_l);
+				id_writes_ccr   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_move_mem_l);
 				id_is_branch    <= if_valid && is_branch_byte;
 				id_is_scc       <= if_valid && is_scc_rr;
 				id_is_dbcc      <= 1'b0;
+				id_is_mem_src   <= if_valid && is_move_mem_l;
 				id_cond         <= if_opcode[11:8];
-				id_unimpl       <= if_valid && !is_nop && !is_moveq && !is_move_rr && !is_add_rr && !is_branch_byte && !is_scc_rr;
+				id_unimpl       <= if_valid && !is_nop && !is_moveq && !is_move_rr && !is_add_rr && !is_branch_byte && !is_scc_rr && !is_move_mem_l;
 			end
 		end
 	end
