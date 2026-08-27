@@ -174,3 +174,50 @@ exact original bug's symptom. Full 11-file `run_pipe_tests.sh` green.
 Next: `(An)+`/`-(An)` (needs the pipeline's first EA-side register write)
 or start on indexed/absolute/PC-relative modes -- see
 `AP040_IMPLEMENTATION_PLAN.md` section 6 item 1.
+
+## 2026-08-27 (later still): milestone 11, JMP (An) / JMP (d16,An)
+
+User asked to pick up BSR/JSR/JMP. Sequenced JMP first: it reuses the EA
+resolution `MOVE.L (An)/(d16,An),Dn` already built, wholesale, and needs
+ZERO new memory-write machinery (unlike BSR/JSR, which both need this
+pipeline's first actual write -- the stack push -- and a register side
+effect, A7's decrement, that isn't the primary ALU destination). JMP's
+only new idea: since decode has no literal displacement to speculate a
+target with, `ap040_execute.v` treats JMP as an UNCONDITIONAL
+misprediction once it resolves, reusing `ex_mispredict`/`ex_recovery_pc`/
+`flush` completely unchanged -- the same wiring DBcc reused from Bcc back
+in milestone 8. Zero new top-level redirect plumbing needed.
+
+Two real, worth-remembering findings from this one -- full writeup in
+`AP040_IMPLEMENTATION_PLAN.md`'s milestone-11 section, right after 5a:
+
+1. **A genuine test-budget bug** (not RTL): `ap040_inst_fetch.v`'s
+   `issued` counter counts every word fetched, INCLUDING ones a later
+   misprediction flush discards. JMP never lets decode guess a real
+   target, so IF races several words past every JMP before EX's
+   unconditional correction arrives -- with two chained JMPs in one test,
+   the usual `PROG_WORDS=10` silently ran out before the second JMP's
+   real post-redirect target ever executed. Caught as a wrong register
+   value, not a hang; fixed with `PROG_WORDS=30`.
+2. **An honestly-reported non-finding**: of four mutations tried, only
+   three caught anything. Dropping the `!held_is_jmp` redirect-suppression
+   guard (same shape move-disp needed in milestone 10) left the test
+   passing -- and that's correct, not a coverage gap to chase: unlike
+   move-disp, which has NO EX-side correction at all (so a bad decode-time
+   guess for it is permanent and unrecoverable), JMP's target is ALWAYS
+   fixed by EX's unconditional misprediction regardless of what decode
+   guessed, so an extra stray speculative redirect just wastes a few
+   cycles of now-discarded fetching. Kept the guard anyway (consistent
+   shape, avoids pointless work), but documented it as defensive rather
+   than claiming mutation coverage that doesn't actually exist for it.
+
+Full 12-file `run_pipe_tests.sh` green.
+
+Next: `BSR`/`JSR` -- the actual next real lift, since both need a genuine
+first for this pipeline (a memory write, plus a non-ALU register side
+effect on the same instruction). See `AP040_IMPLEMENTATION_PLAN.md`
+section 6 item 2 for the concrete shape (an `ap040_pipe_l1.v` port-B write
+path, `wren_b`/`data_b` already reserved but undriven; a second write
+source into the regfile alongside `commit_reg`). JSR becomes close to free
+once BSR's write mechanism exists -- it's JMP's EA resolution (already
+built) plus BSR's push (about to be built).

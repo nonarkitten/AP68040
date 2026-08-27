@@ -1,6 +1,6 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 10: MOVE.L          //
-// (d16,An),Dn)                                                             //
+// AP040_PIPE - MC68040-style pipelined core (milestone 11: JMP (An),       //
+// JMP (d16,An))                                                            //
 //                                                                          //
 // ap040_ea_fetch.v - EA-fetch stage                                       //
 //                                                                          //
@@ -107,6 +107,18 @@
 // must be discarded. An outstanding L1 request (mem_pending) is simply       //
 // abandoned, not unwound -- a read has no side effect, so its eventual        //
 // l1_q_b is just never consumed once mem_pending clears.                     //
+//                                                                            //
+// JMP (An) / JMP (d16,An) (milestone 11, new): the EA (operand_a + eac_imm,   //
+// the exact same expression l1_addr_b already computes) is what JMP needs     //
+// as its RESULT, not an address to dereference -- eac_is_mem_src stays 0 for  //
+// JMP (ap040_decode.v never sets it), so this stage's mem_issue/mem_complete   //
+// FSM never triggers for it and JMP rides the plain, non-stalling "else"       //
+// path below like any register-direct instruction. The only change there is    //
+// eaf_operand_a: `eac_is_jmp ? (operand_a + eac_imm) : operand_a` -- routing     //
+// the computed target into the SAME field ap040_execute.v already reads for      //
+// its EX-forward tap and (via a new case there) ex_recovery_pc. See its           //
+// header for why JMP is modeled as an unconditional misprediction rather than      //
+// a new redirect mechanism.                                                        //
 //--------------------------------------------------------------------------//
 
 module ap040_ea_fetch
@@ -135,6 +147,7 @@ module ap040_ea_fetch
 	input             eac_is_scc,
 	input             eac_is_dbcc,
 	input             eac_is_mem_src,
+	input             eac_is_jmp,
 	input       [3:0] eac_cond,
 
 	// regfile operand read ports (driven combinationally by this stage;
@@ -168,6 +181,7 @@ module ap040_ea_fetch
 	output reg        eaf_is_branch,
 	output reg        eaf_is_scc,
 	output reg        eaf_is_dbcc,
+	output reg        eaf_is_jmp,
 	output reg  [3:0] eaf_cond
 );
 
@@ -200,18 +214,20 @@ wire [31:0] operand_a = eac_src_a_is_imm ? eac_imm :
 wire [31:0] operand_b = fwd_b_from_ex ? ex_fwd_data : rdata_b;
 
 // The effective address: operand_a (An's value, resolved by the mux above)
-// PLUS eac_imm (milestone 10: the sign-extended displacement for
-// MOVE.L (d16,An),Dn, or exactly 0 for plain MOVE.L (An),Dn -- see
-// ap040_decode.v's header for why id_imm is zeroed for the plain case).
-// One formula for both EA modes, not a per-mode branch -- adding a future
-// EA mode that also produces an address+offset shape (indexed, etc.) needs
-// no new logic here, just decode emitting the right eac_imm.
-//
+// PLUS eac_imm (the sign-extended displacement for a (d16,An) form, or
+// exactly 0 for the plain (An) form -- see ap040_decode.v's header for why
+// id_imm is zeroed for the plain case). One formula for both EA modes and
+// both consumers (a memory-source MOVE dereferences it below; JMP uses it
+// directly as its result) -- adding a future EA mode that also produces an
+// address+offset shape (indexed, etc.) needs no new logic here, just
+// decode emitting the right eac_imm.
+wire [31:0] ea_target = operand_a + eac_imm;
+
 // Driven unconditionally, same "compute always, gate consumption" precedent
 // as raddr_b -- harmless when eac_is_mem_src is false, nothing reads l1_q_b
 // that cycle. PC_RESET-relative to match ap040_inst_fetch.v's own L1
 // addressing -- see header.
-assign l1_addr_b = (operand_a + eac_imm - PC_RESET) >> 1;
+assign l1_addr_b = (ea_target - PC_RESET) >> 1;
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -227,6 +243,7 @@ always @(posedge clk) begin
 		eaf_is_branch  <= 1'b0;
 		eaf_is_scc     <= 1'b0;
 		eaf_is_dbcc    <= 1'b0;
+		eaf_is_jmp     <= 1'b0;
 		eaf_cond       <= 4'h0;
 		mem_pending    <= 1'b0;
 	end else if (ce) begin
@@ -250,6 +267,7 @@ always @(posedge clk) begin
 				eaf_is_branch  <= eac_is_branch;
 				eaf_is_scc     <= eac_is_scc;
 				eaf_is_dbcc    <= eac_is_dbcc;
+				eaf_is_jmp     <= 1'b0;   // a mem-source instruction is never also a JMP
 				eaf_cond       <= eac_cond;
 				mem_pending    <= 1'b0;
 			end else begin
@@ -257,7 +275,9 @@ always @(posedge clk) begin
 				eaf_pc         <= eac_pc;
 				eaf_next_pc    <= eac_next_pc;
 				eaf_dest_reg   <= eac_dest_reg;
-				eaf_operand_a  <= operand_a;
+				// JMP: route the computed EA itself, not the register value
+				// alone -- see header.
+				eaf_operand_a  <= eac_is_jmp ? ea_target : operand_a;
 				eaf_operand_b  <= operand_b;
 				eaf_alu_op     <= eac_alu_op;
 				eaf_writes_reg <= eac_writes_reg;
@@ -265,6 +285,7 @@ always @(posedge clk) begin
 				eaf_is_branch  <= eac_is_branch;
 				eaf_is_scc     <= eac_is_scc;
 				eaf_is_dbcc    <= eac_is_dbcc;
+				eaf_is_jmp     <= eac_is_jmp;
 				eaf_cond       <= eac_cond;
 			end
 		end

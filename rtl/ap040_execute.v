@@ -1,5 +1,6 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 8: DBcc)            //
+// AP040_PIPE - MC68040-style pipelined core (milestone 11: JMP (An),       //
+// JMP (d16,An))                                                            //
 //                                                                          //
 // ap040_execute.v - EX stage                                              //
 //                                                                          //
@@ -120,6 +121,7 @@ module ap040_execute
 	input             eaf_is_branch,
 	input             eaf_is_scc,
 	input             eaf_is_dbcc,
+	input             eaf_is_jmp,
 	input       [3:0] eaf_cond,
 
 	input       [4:0] ccr_in,    // already write-through-forwarded by
@@ -216,9 +218,21 @@ wire writes_reg_resolved = eaf_is_dbcc ? (eaf_valid && !cond_result) : eaf_write
 // decremented counter expired -- are architecturally identical to Bcc's
 // not-taken case from IF's point of view: decode guessed taken, so anything
 // but a taken branch is a misprediction recovered to eaf_next_pc.
+//
+// JMP (milestone 11): decode never guesses a target for it at all (no
+// literal displacement exists to speculate with -- see ap040_decode.v's
+// header), so its implicit "guess" is IF's own default sequential advance.
+// That's correct only by the coincidence of the target happening to equal
+// eaf_next_pc, so JMP is modeled as an UNCONDITIONAL misprediction once it
+// reaches EX -- reusing ex_mispredict/ex_recovery_pc/flush exactly as they
+// already exist, no new redirect path. The recovery target is
+// eaf_operand_a itself: ap040_ea_fetch.v routed the computed EA there
+// instead of a register value (see its header) specifically so EX doesn't
+// need a separate "JMP target" input.
 assign ex_mispredict   = eaf_valid && ((eaf_is_branch && !cond_result) ||
-                                        (eaf_is_dbcc   && !dbcc_branch_taken));
-assign ex_recovery_pc  = eaf_next_pc;
+                                        (eaf_is_dbcc   && !dbcc_branch_taken) ||
+                                        eaf_is_jmp);
+assign ex_recovery_pc  = eaf_is_jmp ? eaf_operand_a : eaf_next_pc;
 
 wire [31:0] scc_fill   = {24'd0, {8{cond_result}}};
 wire [31:0] scc_merged = {eaf_operand_b[31:8], scc_fill[7:0]};

@@ -132,7 +132,7 @@ wire  [3:0] id_dest_reg, id_src_reg;
 wire [31:0] id_imm;
 wire  [5:0] id_alu_op;
 wire        id_src_a_is_imm, id_writes_reg, id_writes_ccr;
-wire        id_is_branch, id_is_scc, id_is_dbcc, id_is_mem_src;
+wire        id_is_branch, id_is_scc, id_is_dbcc, id_is_mem_src, id_is_jmp;
 wire  [3:0] id_cond;
 // id_unimpl: decode's "opcode not recognized" bit. Not consumed past decode
 // yet -- nothing traps on it (writes_reg=0 already makes an unrecognized
@@ -147,7 +147,7 @@ wire  [3:0] eac_dest_reg, eac_src_reg;
 wire [31:0] eac_imm;
 wire  [5:0] eac_alu_op;
 wire        eac_src_a_is_imm, eac_writes_reg, eac_writes_ccr;
-wire        eac_is_branch, eac_is_scc, eac_is_dbcc, eac_is_mem_src;
+wire        eac_is_branch, eac_is_scc, eac_is_dbcc, eac_is_mem_src, eac_is_jmp;
 wire  [3:0] eac_cond;
 
 wire        eaf_valid; wire [31:0] eaf_pc; wire [31:0] eaf_next_pc;
@@ -155,7 +155,7 @@ wire  [3:0] eaf_dest_reg;
 wire [31:0] eaf_operand_a, eaf_operand_b;
 wire  [5:0] eaf_alu_op;
 wire        eaf_writes_reg, eaf_writes_ccr;
-wire        eaf_is_branch, eaf_is_scc, eaf_is_dbcc;
+wire        eaf_is_branch, eaf_is_scc, eaf_is_dbcc, eaf_is_jmp;
 wire  [3:0] eaf_cond;
 
 wire        exe_valid; wire [31:0] exe_pc;
@@ -363,6 +363,7 @@ ap040_decode u_id
 	.id_is_scc       (id_is_scc),
 	.id_is_dbcc      (id_is_dbcc),
 	.id_is_mem_src   (id_is_mem_src),
+	.id_is_jmp       (id_is_jmp),
 	.id_cond         (id_cond),
 	.id_unimpl       (id_unimpl)
 );
@@ -389,6 +390,7 @@ ap040_ea_calc u_eac
 	.id_is_scc        (id_is_scc),
 	.id_is_dbcc       (id_is_dbcc),
 	.id_is_mem_src    (id_is_mem_src),
+	.id_is_jmp        (id_is_jmp),
 	.id_cond          (id_cond),
 
 	.ea_stall         (ea_stall),
@@ -407,6 +409,7 @@ ap040_ea_calc u_eac
 	.eac_is_scc       (eac_is_scc),
 	.eac_is_dbcc      (eac_is_dbcc),
 	.eac_is_mem_src   (eac_is_mem_src),
+	.eac_is_jmp       (eac_is_jmp),
 	.eac_cond         (eac_cond)
 );
 
@@ -435,6 +438,7 @@ ap040_ea_fetch #(
 	.eac_is_scc       (eac_is_scc),
 	.eac_is_dbcc      (eac_is_dbcc),
 	.eac_is_mem_src   (eac_is_mem_src),
+	.eac_is_jmp       (eac_is_jmp),
 	.eac_cond         (eac_cond),
 
 	.raddr_a          (raddr_a),
@@ -463,6 +467,7 @@ ap040_ea_fetch #(
 	.eaf_is_branch    (eaf_is_branch),
 	.eaf_is_scc       (eaf_is_scc),
 	.eaf_is_dbcc      (eaf_is_dbcc),
+	.eaf_is_jmp       (eaf_is_jmp),
 	.eaf_cond         (eaf_cond)
 );
 
@@ -485,6 +490,7 @@ ap040_execute u_ex
 	.eaf_is_branch    (eaf_is_branch),
 	.eaf_is_scc       (eaf_is_scc),
 	.eaf_is_dbcc      (eaf_is_dbcc),
+	.eaf_is_jmp       (eaf_is_jmp),
 	.eaf_cond         (eaf_cond),
 
 	.ccr_in           (ccr_resolved),

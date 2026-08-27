@@ -1,11 +1,12 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 9b: MOVE.L (An),Dn) //
+// AP040_PIPE - MC68040-style pipelined core (milestone 11: JMP (An),       //
+// JMP (d16,An))                                                            //
 //                                                                          //
 // ap040_ea_calc.v - EA-calc stage                                         //
 //                                                                          //
 // MOVEQ, register-direct MOVE.L/ADD.L, Bcc/BRA (any displacement width),   //
-// Scc, and DBcc all have no memory effective address to compute, so this   //
-// is still a pure pass-through -- it exists to occupy the pipeline-        //
+// Scc, DBcc, and JMP all have no memory effective address to compute, so   //
+// this is still a pure pass-through -- it exists to occupy the pipeline-   //
 // register slot a real address calculation will use once an EA mode that   //
 // actually needs arithmetic is added, rather than being spliced in later   //
 // and reshaping the pipeline. id_is_branch/id_is_scc/id_cond/              //
@@ -15,14 +16,16 @@
 // header comment. id_next_pc is just one more field in the same            //
 // pass-through shape.                                                     //
 //                                                                          //
-// MOVE.L (An),Dn (milestone 9b, new) is ALSO a pure pass-through here,      //
-// deliberately: its effective address is An's raw value, no arithmetic --   //
-// id_is_mem_src threads through unchanged, same shape as every other flag   //
-// above. This is why the EA-calc/EA-fetch split exists as two stages          //
-// already (per the original plan): the day an EA mode needs real arithmetic //
-// (e.g. (d16,An)), it lands HERE, and EA-fetch's memory-access/stall logic   //
-// (see its header) doesn't need to change at all -- it already just         //
-// consumes whatever address EA-calc resolved.                              //
+// MOVE.L (An),Dn (milestone 9b) and JMP (An)/(d16,An) (milestone 11) are    //
+// ALSO pure pass-throughs here, deliberately: their effective addresses     //
+// are An's raw value (plus id_imm's displacement for the (d16,An) forms),   //
+// no arithmetic -- id_is_mem_src/id_is_jmp thread through unchanged, same   //
+// shape as every other flag above. This is why the EA-calc/EA-fetch split   //
+// exists as two stages already (per the original plan): the day an EA mode  //
+// needs real arithmetic (indexed modes, etc.), it lands HERE, and EA-       //
+// fetch's memory-access/stall logic (see its header) doesn't need to        //
+// change at all -- it already just consumes whatever address EA-calc        //
+// resolved.                                                                 //
 //                                                                          //
 // flush: when ap040_execute.v detects a mispredicted branch, everything     //
 // speculatively fetched behind it -- including whatever is sitting here -- //
@@ -52,6 +55,7 @@ module ap040_ea_calc
 	input             id_is_scc,
 	input             id_is_dbcc,
 	input             id_is_mem_src,
+	input             id_is_jmp,
 	input       [3:0] id_cond,
 
 	output            ea_stall,   // to ID: no local stall of its own yet
@@ -70,6 +74,7 @@ module ap040_ea_calc
 	output reg        eac_is_scc,
 	output reg        eac_is_dbcc,
 	output reg        eac_is_mem_src,
+	output reg        eac_is_jmp,
 	output reg  [3:0] eac_cond
 );
 
@@ -91,6 +96,7 @@ always @(posedge clk) begin
 		eac_is_scc       <= 1'b0;
 		eac_is_dbcc      <= 1'b0;
 		eac_is_mem_src   <= 1'b0;
+		eac_is_jmp       <= 1'b0;
 		eac_cond         <= 4'h0;
 	end else if (ce) begin
 		if (flush) begin
@@ -110,6 +116,7 @@ always @(posedge clk) begin
 			eac_is_scc       <= id_is_scc;
 			eac_is_dbcc      <= id_is_dbcc;
 			eac_is_mem_src   <= id_is_mem_src;
+			eac_is_jmp       <= id_is_jmp;
 			eac_cond         <= id_cond;
 		end
 	end

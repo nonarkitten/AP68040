@@ -1,18 +1,49 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 10: MOVE.L          //
-// (d16,An),Dn)                                                             //
+// AP040_PIPE - MC68040-style pipelined core (milestone 11: JMP (An),       //
+// JMP (d16,An))                                                            //
 //                                                                          //
 // ap040_decode.v - ID stage                                               //
 //                                                                          //
 // Recognizes NOP, MOVEQ, register-direct-to-register-direct MOVE.L,        //
 // register-direct ADD.L Dn,Dm, register-direct Scc.B Dn, DBcc Dn,<label>,  //
-// MOVE.L (An),Dn and MOVE.L (d16,An),Dn, and the whole Bcc family           //
-// including its 16-/32-bit displacement forms (BRA included, as its        //
-// "always true" special case -- see below). Anything else classifies as    //
-// "unimplemented" and rides through the rest of the pipeline as a safe     //
-// bubble (id_writes_reg stays 0) rather than an error; a later milestone   //
-// replaces this with the real instruction-field decode extracted from      //
-// ap040_core.v's S_DECODE.                                                 //
+// MOVE.L (An),Dn, MOVE.L (d16,An),Dn, JMP (An) and JMP (d16,An), and the    //
+// whole Bcc family including its 16-/32-bit displacement forms (BRA        //
+// included, as its "always true" special case -- see below). Anything      //
+// else classifies as "unimplemented" and rides through the rest of the     //
+// pipeline as a safe bubble (id_writes_reg stays 0) rather than an error;  //
+// a later milestone replaces this with the real instruction-field decode   //
+// extracted from ap040_core.v's S_DECODE.                                  //
+//                                                                          //
+// JMP (An) / JMP (d16,An) (milestone 11, new): opcode 0100 1110 11 mmm rrr //
+// (0x4EC0-0x4EFF), mmm=010 for (An) [single word, no gather] or mmm=101    //
+// for (d16,An) [gathers exactly like MOVE.L (d16,An),Dn]. Verified against //
+// ap040_core.v:5356 (`d_op8_6 == 3'b011` selects JMP within the 0x4EC0-    //
+// 0x4EFF "misc" group's default/mode-111 arm; JSR is `d_op8_6 == 3'b010`   //
+// in the same arm, not yet implemented) and its illegal-mode guard         //
+// (d_mode<2, ==3, ==4, or immediate all illegal -- (An)/(d16,An) are the   //
+// two modes this decoder supports, matching the MOVE.L (An)/(d16,An)       //
+// scope already built). rtl_old's S_JMP1 (ap040_core.v:3064) is                //
+// `go_pc(ea_addr)` unconditionally once the EA resolves (an odd-target      //
+// address-error check is deferred -- same exception-delivery dependency     //
+// TRAPcc and DBcc's odd-target check already defer on).                     //
+//                                                                          //
+// JMP's target reuses EVERYTHING MOVE.L (An)/(d16,An),Dn already built for   //
+// EA resolution (id_src_reg = An's unified index, id_imm = the                //
+// displacement or 0) -- what's different is what CONSUMES that EA. A         //
+// memory-source MOVE dereferences it (ap040_ea_fetch.v's mem_issue/            //
+// mem_complete FSM); JMP does NOT dereference anything -- the computed          //
+// address IS the result, routed straight into eaf_operand_a on the plain,        //
+// non-stalling path (id_is_mem_src stays 0 for JMP; see                           //
+// ap040_ea_fetch.v's header for where the `operand_a + eac_imm` add happens         //
+// for it). JMP also can't use the Bcc/BRA speculative-redirect mechanism             //
+// (id_redirect_valid/id_redirect_pc) the way branches do: that mechanism             //
+// needs a LITERAL displacement known at decode time, and JMP's target is a            //
+// REGISTER value not resolved until EA-fetch. Instead, id_is_jmp threads               //
+// through to ap040_execute.v, which treats an unresolved JMP as an                     //
+// UNCONDITIONAL misprediction against decode's implicit "keep going                     //
+// sequentially" non-guess -- reusing ex_mispredict/ex_recovery_pc completely              //
+// unchanged, the same wiring DBcc reused from Bcc in milestone 8. See                     //
+// ap040_execute.v's header for the exact mechanism.                                        //
 //                                                                          //
 // MOVE.L (d16,An),Dn (milestone 10, new): a THIRD trigger onto the same     //
 // gather state machine DBcc added a second one to -- (d16,An) always         //
@@ -200,6 +231,7 @@ module ap040_decode
 	output reg        id_is_scc,
 	output reg        id_is_dbcc,
 	output reg        id_is_mem_src,
+	output reg        id_is_jmp,
 	output reg  [3:0] id_cond,
 	output reg        id_unimpl
 );
@@ -289,6 +321,14 @@ wire is_move_disp = (if_opcode[15:12] == 4'b0010) &&
                      (if_opcode[8:6]  == 3'b000) &&
                      (if_opcode[5:3]  == 3'b101);
 
+// JMP <ea>: 0100 1110 11 mmm rrr -- see header. Only the two EA modes this
+// decoder already resolves elsewhere (An), (d16,An) are recognized; every
+// other legal JMP mode (indexed, absolute, PC-relative) falls through to
+// id_unimpl, same scope discipline as every prior instruction.
+wire is_jmp_opcode = (if_opcode[15:6] == 10'b0100111011);
+wire is_jmp_an     = is_jmp_opcode && (if_opcode[5:3] == 3'b010);
+wire is_jmp_disp   = is_jmp_opcode && (if_opcode[5:3] == 3'b101);
+
 wire is_nop = (if_opcode == `AP040_OP_NOP);
 
 // Gather state -- see header comment. 0 = idle/normal decode cycle;
@@ -300,10 +340,13 @@ wire is_nop = (if_opcode == `AP040_OP_NOP);
 // is "the extra register field" generically -- An for move-disp, the loop
 // counter for DBcc, meaningless when neither flag is set; held_dest_reg is
 // move-disp-only (Dn), meaningless otherwise.
+// held_is_jmp (milestone 11) adds a fourth kind: JMP (d16,An)'s gather. It
+// needs held_reg (An) but not held_dest_reg (JMP writes no register).
 reg  [1:0]  ext_pending;
 reg         held_is_long;
 reg         held_is_dbcc;
 reg         held_is_move_disp;
+reg         held_is_jmp;
 reg  [2:0]  held_reg;
 reg  [2:0]  held_dest_reg;
 reg  [31:0] held_pc;
@@ -323,10 +366,12 @@ wire [31:0] gather_disp = held_is_long ? {disp_acc[15:0], if_opcode}
 // it's fetched, gated to only when not already mid-gather -- if_opcode
 // during a gather cycle is data, not an opcode, and could coincidentally
 // bit-match the byte-form pattern), or on the exact cycle a word/long
-// gather completes -- EXCEPT a move-disp gather, whose displacement is a
-// memory offset, not a branch target (see header comment).
+// gather completes -- EXCEPT a move-disp or JMP gather: move-disp's
+// displacement is a memory offset, not a branch target, and JMP has no
+// literal target to speculate with at all (its target is a register value,
+// not known until EA-fetch -- see header comment).
 wire redirect_from_byte   = if_valid && is_branch_byte && (ext_pending == 2'd0);
-wire redirect_from_gather = completing_gather && !held_is_move_disp;
+wire redirect_from_gather = completing_gather && !held_is_move_disp && !held_is_jmp;
 
 assign id_redirect_valid = redirect_from_byte || redirect_from_gather;
 assign id_redirect_pc    = redirect_from_gather
@@ -349,12 +394,14 @@ always @(posedge clk) begin
 		id_is_scc       <= 1'b0;
 		id_is_dbcc      <= 1'b0;
 		id_is_mem_src   <= 1'b0;
+		id_is_jmp       <= 1'b0;
 		id_cond         <= 4'h0;
 		id_unimpl       <= 1'b0;
 		ext_pending     <= 2'd0;
 		held_is_long    <= 1'b0;
 		held_is_dbcc    <= 1'b0;
 		held_is_move_disp <= 1'b0;
+		held_is_jmp     <= 1'b0;
 		held_reg        <= 3'h0;
 		held_dest_reg   <= 3'h0;
 		held_pc         <= 32'h0;
@@ -375,24 +422,28 @@ always @(posedge clk) begin
 					id_next_pc      <= held_pc + 32'd2 + (held_is_long ? 32'd4 : 32'd2);
 					id_dest_reg     <= held_is_dbcc ? {1'b0, held_reg} :
 					                    held_is_move_disp ? {1'b0, held_dest_reg} : 4'h0;
+					// move-disp and JMP-disp both read An as their EA base
+					// (held_reg, unified index 8+n); DBcc's held_reg means
+					// its loop counter instead.
 					id_src_reg      <= held_is_dbcc ? {1'b0, held_reg} :
-					                    held_is_move_disp ? {1'b1, held_reg} : 4'h0;
+					                    (held_is_move_disp || held_is_jmp) ? {1'b1, held_reg} : 4'h0;
 					// gather_disp is already the sign-extended displacement
 					// word (same wire Bcc/DBcc use for their target math) --
-					// move-disp reuses it verbatim as id_imm, no new
-					// arithmetic. Zero for every other gather kind, matching
-					// the plain-(An) id_imm fix below (this field is a real
-					// address offset now, not just MOVEQ's unused-elsewhere
-					// immediate -- see header).
-					id_imm          <= held_is_move_disp ? gather_disp : 32'h0;
+					// move-disp and JMP-disp both reuse it verbatim as
+					// id_imm, no new arithmetic. Zero for every other gather
+					// kind, matching the plain-(An)/JMP(An) id_imm fix below
+					// (this field is a real address offset now, not just
+					// MOVEQ's unused-elsewhere immediate -- see header).
+					id_imm          <= (held_is_move_disp || held_is_jmp) ? gather_disp : 32'h0;
 					id_alu_op       <= `AP040_ALU_MOVE;
 					id_src_a_is_imm <= 1'b0;
 					id_writes_reg   <= held_is_move_disp;   // DBcc's write is dynamic -- see header
 					id_writes_ccr   <= held_is_move_disp;
-					id_is_branch    <= !held_is_dbcc && !held_is_move_disp;
+					id_is_branch    <= !held_is_dbcc && !held_is_move_disp && !held_is_jmp;
 					id_is_scc       <= 1'b0;
 					id_is_dbcc      <= held_is_dbcc;
 					id_is_mem_src   <= held_is_move_disp;
+					id_is_jmp       <= held_is_jmp;
 					id_cond         <= held_cond;
 					id_unimpl       <= 1'b0;
 					ext_pending     <= 2'd0;
@@ -400,17 +451,18 @@ always @(posedge clk) begin
 					id_valid    <= 1'b0;
 					ext_pending <= ext_pending - 2'd1;
 				end
-			end else if (is_branch_word || is_branch_long || is_dbcc || is_move_disp) begin
-				// Opcode word of a word/long-form branch, a DBcc, or a
-				// MOVE.L (d16,An),Dn (all word-form except long-branch): not
-				// a complete instruction yet -- hold what we know, start
-				// gathering.
+			end else if (is_branch_word || is_branch_long || is_dbcc || is_move_disp || is_jmp_disp) begin
+				// Opcode word of a word/long-form branch, a DBcc,
+				// MOVE.L (d16,An),Dn, or JMP (d16,An) (all word-form except
+				// long-branch): not a complete instruction yet -- hold what
+				// we know, start gathering.
 				id_valid      <= 1'b0;
 				held_pc       <= if_pc;
 				held_cond     <= if_opcode[11:8];
 				held_is_long  <= is_branch_long;
 				held_is_dbcc  <= is_dbcc;
 				held_is_move_disp <= is_move_disp;
+				held_is_jmp   <= is_jmp_disp;
 				held_reg      <= if_opcode[2:0];
 				held_dest_reg <= if_opcode[11:9];
 				ext_pending   <= is_branch_long ? 2'd2 : 2'd1;
@@ -419,19 +471,21 @@ always @(posedge clk) begin
 				id_pc           <= if_pc;
 				id_next_pc      <= if_pc + 32'd2;
 				id_dest_reg     <= is_scc_rr ? {1'b0, d_rn} : {1'b0, d_reg9};
-				// is_move_mem_l's src_reg is An, not Dn -- the unified index's
-				// top bit (8+n vs 0+n) is the ONLY thing that distinguishes
-				// "read this register's value as an operand" (every other
-				// instruction so far) from "read this register's value as an
-				// ADDRESS" here; ap040_ea_fetch.v's existing operand_a mux
-				// (regfile read + EX-forward) doesn't need to know the
-				// difference, it just resolves whichever register this is.
-				id_src_reg      <= is_move_mem_l ? {1'b1, d_rn} : {1'b0, d_rn};
-				// Zeroed for is_move_mem_l (was the sign-extended opcode low
-				// byte for EVERY instruction here, harmless until
-				// ap040_ea_fetch.v started adding eac_imm to the address
-				// this milestone -- see header). Still meaningful for MOVEQ.
-				id_imm          <= is_move_mem_l ? 32'h0 : {{24{if_opcode[7]}}, if_opcode[7:0]};
+				// is_move_mem_l/is_jmp_an's src_reg is An, not Dn -- the
+				// unified index's top bit (8+n vs 0+n) is the ONLY thing
+				// that distinguishes "read this register's value as an
+				// operand" (every other instruction so far) from "read this
+				// register's value as an ADDRESS" here; ap040_ea_fetch.v's
+				// existing operand_a mux (regfile read + EX-forward)
+				// doesn't need to know the difference, it just resolves
+				// whichever register this is.
+				id_src_reg      <= (is_move_mem_l || is_jmp_an) ? {1'b1, d_rn} : {1'b0, d_rn};
+				// Zeroed for is_move_mem_l/is_jmp_an (was the sign-extended
+				// opcode low byte for EVERY instruction here, harmless
+				// until ap040_ea_fetch.v started adding eac_imm to the
+				// address for memory-source instructions -- see header).
+				// Still meaningful for MOVEQ.
+				id_imm          <= (is_move_mem_l || is_jmp_an) ? 32'h0 : {{24{if_opcode[7]}}, if_opcode[7:0]};
 				id_alu_op       <= is_add_rr ? `AP040_ALU_ADD : `AP040_ALU_MOVE;
 				id_src_a_is_imm <= if_valid && is_moveq;
 				id_writes_reg   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_scc_rr || is_move_mem_l);
@@ -440,8 +494,9 @@ always @(posedge clk) begin
 				id_is_scc       <= if_valid && is_scc_rr;
 				id_is_dbcc      <= 1'b0;
 				id_is_mem_src   <= if_valid && is_move_mem_l;
+				id_is_jmp       <= if_valid && is_jmp_an;
 				id_cond         <= if_opcode[11:8];
-				id_unimpl       <= if_valid && !is_nop && !is_moveq && !is_move_rr && !is_add_rr && !is_branch_byte && !is_scc_rr && !is_move_mem_l;
+				id_unimpl       <= if_valid && !is_nop && !is_moveq && !is_move_rr && !is_add_rr && !is_branch_byte && !is_scc_rr && !is_move_mem_l && !is_jmp_an;
 			end
 		end
 	end

@@ -98,10 +98,11 @@ Completed milestones (`tb/run_pipe_tests.sh`, one file per milestone):
 | 9a | Unified L1 (`ap040_pipe_l1.v`) replaces IF's inline ROM; port B reserved for data | all of the above, unchanged behavior |
 | 9b | MOVE.L (An),Dn -- first memory read, first genuine pipeline stall | `tb_ap040_pipe_move_mem.v` |
 | 10 | MOVE.L (d16,An),Dn -- first real EA displacement arithmetic; found and fixed a real L1/stall bug (see below) | `tb_ap040_pipe_move_disp.v` |
+| 11 | JMP (An), JMP (d16,An) -- EA-computed PC redirect, reusing EX's mispredict/recovery mechanism unconditionally | `tb_ap040_pipe_jmp.v` |
 
 Register-direct/immediate/register-indirect(+displacement) only -- no
-indexed/absolute/PC-relative EA modes, no byte/word sizes, no writes to
-memory yet. See section 6.
+indexed/absolute/PC-relative EA modes, no byte/word sizes, no memory
+writes, no BSR/JSR (need a memory write) yet. See section 6.
 
 ## 5a. The unified-L1 decision (2026-08-27)
 
@@ -264,9 +265,61 @@ surface it. Worth deliberately constructing scenarios like this again once
 more stall sources exist (a real L1 miss, a store's write-then-read
 hazard), not just testing one mechanism at a time in isolation.
 
+**DONE (milestone 11, 2026-08-27): JMP (An), JMP (d16,An).** The first
+control-flow instruction whose target isn't known until a register is
+read, and it turned out to need almost no new mechanism at all -- just a
+new way to USE two that already existed:
+
+- **EA resolution**: identical to `MOVE.L (An)/(d16,An),Dn` -- same
+  `id_src_reg`/`id_imm` fields, same gather machinery for the displacement
+  form. What differs is the CONSUMER: a memory-source MOVE dereferences
+  the computed address (`ap040_ea_fetch.v`'s `mem_issue`/`mem_complete`
+  FSM); JMP never sets `id_is_mem_src`, so it takes the plain,
+  non-stalling path, and the computed address itself (`operand_a +
+  eac_imm`) is routed straight into `eaf_operand_a` as the result.
+- **The redirect**: decode has no literal displacement to speculate a
+  target with (unlike Bcc/DBcc), so it doesn't try -- `id_is_jmp` never
+  participates in `id_redirect_valid`. Instead `ap040_execute.v` treats an
+  unresolved JMP as an UNCONDITIONAL misprediction against IF's implicit
+  "keep going sequentially" non-guess, reusing `ex_mispredict`/
+  `ex_recovery_pc`/`flush` completely unchanged -- the exact wiring DBcc
+  reused from Bcc in milestone 8, now reused a second time for a genuinely
+  different kind of instruction. `ex_recovery_pc` becomes `eaf_operand_a`
+  (the computed target) instead of `eaf_next_pc` when `eaf_is_jmp`.
+
+Four mutations were tried; three caught cleanly (dropping `eaf_is_jmp`
+from `ex_mispredict`, reverting `ex_recovery_pc` to always `eaf_next_pc`,
+and routing plain `operand_a` instead of `operand_a + eac_imm` for JMP --
+each breaks the test in the way predicted). **The fourth did NOT catch
+anything, and that's a real, worth-recording finding, not a gap papered
+over**: dropping the `!held_is_jmp` guard on `redirect_from_gather` (the
+same guard shape `held_is_move_disp` needed in milestone 10) left the test
+passing. Unlike move-disp -- which has NO EX-side correction mechanism at
+all, so a wrong decode-time redirect for it is a permanent, unrecoverable
+bug -- JMP's target is ALWAYS corrected by EX's unconditional
+misprediction regardless of what decode guessed, so a stray extra
+speculative redirect only wastes a few cycles of now-discarded fetching;
+it cannot survive to be observed. The guard is kept anyway (consistent
+shape with move-disp, avoids pointless mis-speculation), but it is
+correctly understood as defensive, not load-bearing, for JMP specifically
+-- don't claim mutation coverage a test didn't actually demonstrate.
+
+Also surfaced a real test-construction issue, not an RTL bug:
+`ap040_inst_fetch.v`'s `issued` counter (the `have_more`/`PROG_WORDS`
+budget) counts every word FETCHED, including ones a later misprediction
+flush discards. JMP never lets decode speculate a real target, so IF
+races several words past EVERY JMP before EX's unconditional-misprediction
+correction arrives and redirects it back -- and with TWO chained JMPs in
+one test program, `PROG_WORDS=10` (the size every earlier test needed)
+silently ran out before the second JMP's real, post-redirect target ever
+got to execute. Not a hang -- caught cleanly as a wrong final register
+value, but worth remembering: any test chaining multiple JMP/Bcc
+mispredictions needs a substantially larger budget than instruction count
+alone would suggest.
+
 ## 5. Verification discipline (keep doing this)
 
-This is what has actually kept the pipeline correct across ten milestones
+This is what has actually kept the pipeline correct across eleven milestones
 of rewrites; don't relax it for speed:
 
 - **Bit-exact opcode/semantics verification against `rtl_old`.** Every
@@ -309,9 +362,22 @@ of rewrites; don't relax it for speed:
    regfile from EA-calc/EA-fetch, not just a read, and a decision on WHEN
    the update commits relative to a fault), then indexed/absolute/
    PC-relative.
-2. **BSR / JMP / JSR.** BSR needs the pipeline's first real memory *write*
-   (stack push) and RTS needs a read; JMP/JSR need real effective-address
-   modes, not just displacement math. Natural follow-on once (1) lands.
+2. **DONE (milestone 11): `JMP (An)`, `JMP (d16,An)`** -- see the writeup
+   above section 5. **`BSR`/`JSR` are the natural next step and still
+   NOT done** -- unlike JMP, both need the pipeline's first real memory
+   *write* (the return-address push to `-(A7)`) plus a register side
+   effect (A7's decrement) that isn't the instruction's primary ALU
+   result, landing on the SAME instruction as a memory access. That's
+   more new machinery than JMP needed, not less: expect it to need an
+   actual write path on `ap040_pipe_l1.v` port B (the module already has
+   `wren_b`/`data_b`, reserved but never driven by any stage yet) and a
+   second, non-ALU register-write source feeding the regfile write port
+   alongside `commit_reg`'s existing one. `RTS` (a read from `(A7)+`,
+   register-indirect-postincrement into the PC) is the natural close-out
+   once a write exists to test push/pop symmetry against. Once BSR's write
+   mechanism exists, JSR is close to free -- it's JMP's EA resolution
+   (already built) plus BSR's push (about to be built), not a new
+   mechanism of its own.
 2b. **DBcc's deferred odd-target address-error** and **TRAPcc** both need
    the next item before they can be finished, not before they can be
    started -- see their notes in `ap040_execute.v`/`AP040_IMPLEMENTATION_PLAN.md`
