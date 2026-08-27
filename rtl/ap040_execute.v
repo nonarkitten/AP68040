@@ -1,6 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 11: JMP (An),       //
-// JMP (d16,An))                                                            //
+// AP040_PIPE - MC68040-style pipelined core (milestone 13: BSR, JSR)       //
 //                                                                          //
 // ap040_execute.v - EX stage                                              //
 //                                                                          //
@@ -122,6 +121,8 @@ module ap040_execute
 	input             eaf_is_scc,
 	input             eaf_is_dbcc,
 	input             eaf_is_jmp,
+	input             eaf_is_bsr,
+	input             eaf_is_jsr,
 	input       [3:0] eaf_cond,
 
 	input       [4:0] ccr_in,    // already write-through-forwarded by
@@ -229,16 +230,31 @@ wire writes_reg_resolved = eaf_is_dbcc ? (eaf_valid && !cond_result) : eaf_write
 // eaf_operand_a itself: ap040_ea_fetch.v routed the computed EA there
 // instead of a register value (see its header) specifically so EX doesn't
 // need a separate "JMP target" input.
+//
+// JSR (milestone 13): the SAME reasoning as JMP -- its target is An + a
+// possible displacement, not known until a register is read, so decode
+// never speculates one and JSR joins JMP in this OR-chain. BSR is
+// deliberately NOT here: it reuses Bcc's byte/word/long gather and
+// speculative decode-time redirect verbatim (unconditionally taken, always
+// correct -- see ap040_decode.v's header), so by the time a BSR reaches EX
+// the redirect has already happened and there is nothing left to correct.
 assign ex_mispredict   = eaf_valid && ((eaf_is_branch && !cond_result) ||
                                         (eaf_is_dbcc   && !dbcc_branch_taken) ||
-                                        eaf_is_jmp);
-assign ex_recovery_pc  = eaf_is_jmp ? eaf_operand_a : eaf_next_pc;
+                                        eaf_is_jmp || eaf_is_jsr);
+assign ex_recovery_pc  = (eaf_is_jmp || eaf_is_jsr) ? eaf_operand_a : eaf_next_pc;
 
 wire [31:0] scc_fill   = {24'd0, {8{cond_result}}};
 wire [31:0] scc_merged = {eaf_operand_b[31:8], scc_fill[7:0]};
 
+// BSR/JSR: eaf_operand_b already IS the result -- ap040_ea_fetch.v computed
+// A7-4 there (the same expression it used for the push's write address),
+// so this stage just selects it, the same "precomputed elsewhere, EX only
+// picks" shape scc_merged/dbcc_result already use. No generic-ALU op is
+// used for this (eaf_operand_a is busy carrying JSR's redirect target and
+// can't also carry a literal "4" operand) -- see ap040_ea_fetch.v's header.
 wire [31:0] combined_result = eaf_is_scc  ? scc_merged :
                                eaf_is_dbcc ? dbcc_result :
+                               (eaf_is_bsr || eaf_is_jsr) ? eaf_operand_b :
                                              alu_result;
 
 assign ex_fwd_valid = eaf_valid && writes_reg_resolved;

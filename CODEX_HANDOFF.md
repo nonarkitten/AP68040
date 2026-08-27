@@ -273,3 +273,52 @@ to drive `wren_b`/`address_b`(the L1 word index for `A7-4`)/`data_b`(the
 return address) respecting `wr_busy`, plus a second, non-ALU register-write
 source into the regfile for A7's decrement (alongside `commit_reg`'s
 existing one). See `AP040_IMPLEMENTATION_PLAN.md` section 6 item 2.
+
+## 2026-08-27 (later still): milestone 13, BSR + JSR
+
+User: "Okie dokie -- let's do BSR/JSR!" Both landed together, same set of
+edits across `ap040_decode.v`/`ap040_ea_calc.v`/`ap040_ea_fetch.v`/
+`ap040_execute.v`/`ap040_pipe_core.v` -- turned out to need far less new
+machinery than the "next: a second non-ALU register-write source" note
+above predicted:
+
+- **BSR reuses Bcc's speculative decode-time redirect verbatim** --
+  unconditionally taken, so it's always correct, and EX has nothing left
+  to correct (`ex_mispredict` explicitly excludes `eaf_is_bsr`). Kept as
+  its own `id_is_bsr` flag rather than folded into `id_is_branch`: BSR's
+  condition-code field bits literally encode "F" (always false), which
+  would make `cond_true()` wrongly fire a misprediction if misclassified.
+- **JSR reuses JMP's EA resolution and gather unchanged** -- one opcode
+  bit different from JMP, excluded from the speculative redirect the same
+  way `held_is_jmp` is (its target isn't known until EA resolves), rides
+  `ex_mispredict`/`ex_recovery_pc` unconditionally like JMP already does.
+- **No second regfile write port needed.** Decode sets `id_dest_reg = A7`
+  for both BSR and JSR, so EA-fetch's EXISTING `operand_b` mux (port B,
+  already EX-forwarded) resolves A7's current value for free.
+  `push_addr = operand_b - 4` is computed once in EA-fetch, reused both
+  as the L1 write address and as the eventual `commit_reg` value -- the
+  same write port every other instruction already uses, just with a
+  non-ALU value substituted into `combined_result` for these two ops.
+- **The write-side stall is simpler than the read side's `mem_issue`/
+  `mem_complete` FSM** -- no "wait for response" phase, just "wait for
+  the port," so one term (`wr_stall`) bubbles EX with no pending latch.
+- **No real RTL bugs surfaced this milestone** -- milestone 12 having
+  front-loaded the write buffer's own bugs before anything depended on
+  them gets the credit. Both testbenches (`tb_ap040_pipe_bsr.v`,
+  `tb_ap040_pipe_jsr.v`) passed on first real compile/run.
+- Mutation testing: BSR's redirect-byte guard, redirect-gather guard, and
+  push-data-source (`eac_next_pc` vs `eac_pc`) all caught cleanly. JSR's
+  `ex_mispredict`/`ex_recovery_pc` participation both caught cleanly.
+  JSR's `redirect_from_gather` guard mutation was **not caught** -- an
+  honest non-finding, same shape and same reason as JMP's in milestone
+  11 (EX's unconditional correction masks a bad decode-time guess before
+  it's observable). Full detail, including exact mutation diffs and
+  reasoning, is in `AP040_IMPLEMENTATION_PLAN.md`'s milestone-13 writeup.
+
+Full 15-file `run_pipe_tests.sh` green (13 pipe-core tests + BSR + JSR +
+the standalone `l1_wbuf` test).
+
+Next: `RTS` -- `(A7)+` into the PC, the natural pop to BSR/JSR's push, and
+the first instruction to actually exercise the write buffer's
+read-after-write forwarding path (built in milestone 12, unreachable by
+anything until now). See `AP040_IMPLEMENTATION_PLAN.md` section 6 item 2.

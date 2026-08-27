@@ -28,7 +28,7 @@ SRC="$RTL/ap040_pipe_core.v $RTL/ap040_inst_fetch.v $RTL/ap040_decode.v \
 # simulation roots -- not wrong exactly, just pointless and confusing.
 L1_SRC="$RTL/ap040_pipe_l1.v"
 
-TESTS="nop moveq add bra bcc bccw bccl scc dbcc move_mem move_disp jmp"
+TESTS="nop moveq add bra bcc bccw bccl scc dbcc move_mem move_disp jmp bsr jsr"
 
 echo "== compiling pipe benches =="
 for t in $TESTS; do

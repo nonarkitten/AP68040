@@ -1,6 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 11: JMP (An),       //
-// JMP (d16,An))                                                            //
+// AP040_PIPE - MC68040-style pipelined core (milestone 13: BSR, JSR)       //
 //                                                                          //
 // ap040_ea_fetch.v - EA-fetch stage                                       //
 //                                                                          //
@@ -119,6 +118,43 @@
 // its EX-forward tap and (via a new case there) ex_recovery_pc. See its           //
 // header for why JMP is modeled as an unconditional misprediction rather than      //
 // a new redirect mechanism.                                                        //
+//                                                                            //
+// BSR / JSR (milestone 13, new): this pipeline's first genuine memory WRITE,   //
+// and its second kind of stall (mem_issue's read-side FSM has existed since     //
+// milestone 9b; this is the write-side counterpart). Both push the return        //
+// address (eac_next_pc -- already exactly right, no new arithmetic: it's the      //
+// address of whatever comes after the whole BSR/JSR, extension words              //
+// included, the same field id_next_pc has threaded since milestone 7) onto        //
+// -(A7), then decrement A7 by 4. Both quantities the push needs -- the WRITE       //
+// ADDRESS (A7-4) and the NEW A7 VALUE to commit -- are the SAME expression,         //
+// and ap040_decode.v set eac_dest_reg to A7's unified index (4'd15) for both        //
+// instructions specifically so operand_b (port B, "the destination register's       //
+// current value", already resolved with full EX-forwarding) gives us A7's            //
+// CURRENT value for free -- no new regfile read, no new forwarding mux. JSR's         //
+// own EA target (An + eac_imm, via operand_a, exactly like JMP) and BSR/JSR's          //
+// push address (operand_b - 4) are simply two DIFFERENT fields, resolved from           //
+// two DIFFERENT ports, with no conflict.                                                //
+//                                                                            //
+//   l1_addr_b (extended): now selects between ea_target (a memory-source read     //
+//   or JMP/JSR's redirect target) and push_addr (operand_b - 4) depending on        //
+//   which this cycle's instruction actually is -- mutually exclusive by              //
+//   construction, an instruction is never more than one of these at once.             //
+//   l1_wren_b/l1_data_b: asserted whenever eac_is_bsr||eac_is_jsr, driving the          //
+//   SAME push_addr and eac_next_pc as the data -- held stable (not gated by any          //
+//   "have we issued yet" latch) for as long as eac_* itself stays stable, which           //
+//   the stall below guarantees.                                                            //
+//   wr_stall (`eac_valid && (eac_is_bsr||eac_is_jsr) && l1_wr_busy`): unlike a               //
+//   read, a write needs no "wait for the response" phase -- ap040_pipe_l1.v's                //
+//   OWN contract (see its header) is that asserting wren_b while wr_busy is LOW               //
+//   always succeeds THIS cycle, so the only thing to wait for is the port being                //
+//   free at all. When wr_stall is false (either this isn't a push, or it is and                 //
+//   l1_wr_busy just read low), the push -- if any -- is being accepted THIS SAME                 //
+//   cycle, and the instruction proceeds to EX in that SAME cycle carrying                         //
+//   eaf_operand_b = operand_b - 4 as its result (ap040_execute.v routes this into                  //
+//   the regfile commit for A7, exactly the same "dedicated combinational result,                    //
+//   not the generic ALU" pattern DBcc's decrement and Scc's byte-merge already use;                  //
+//   see its header for why the generic ALU wasn't used here either -- eaf_operand_a                   //
+//   is busy carrying JSR's redirect target and can't also carry a "4" operand).                        //
 //--------------------------------------------------------------------------//
 
 module ap040_ea_fetch
@@ -148,6 +184,8 @@ module ap040_ea_fetch
 	input             eac_is_dbcc,
 	input             eac_is_mem_src,
 	input             eac_is_jmp,
+	input             eac_is_bsr,
+	input             eac_is_jsr,
 	input       [3:0] eac_cond,
 
 	// regfile operand read ports (driven combinationally by this stage;
@@ -163,9 +201,13 @@ module ap040_ea_fetch
 	input       [3:0] ex_fwd_dest,
 	input      [31:0] ex_fwd_data,
 
-	// ap040_pipe_l1.v port B -- read-only from here (see header)
+	// ap040_pipe_l1.v port B -- read for a memory-source instruction or
+	// JMP/JSR's redirect target; write for BSR/JSR's push -- see header.
 	output [L1_AW-1:0] l1_addr_b,
 	input        [31:0] l1_q_b,
+	output              l1_wren_b,
+	output       [31:0] l1_data_b,
+	input               l1_wr_busy,
 
 	output            eaf_stall,  // to EA-calc
 
@@ -182,6 +224,8 @@ module ap040_ea_fetch
 	output reg        eaf_is_scc,
 	output reg        eaf_is_dbcc,
 	output reg        eaf_is_jmp,
+	output reg        eaf_is_bsr,
+	output reg        eaf_is_jsr,
 	output reg  [3:0] eaf_cond
 );
 
@@ -191,8 +235,13 @@ reg mem_pending;   // an L1 port-B request is in flight for the CURRENT eac_*
 
 wire mem_issue    = eac_valid && eac_is_mem_src && !mem_pending;
 wire mem_complete = mem_pending;
+// BSR/JSR's push -- no "pending" latch needed, see header: a write either
+// succeeds immediately (l1_wr_busy low) or must wait for the port, but
+// never needs a separate multi-cycle completion phase the way a read does.
+wire eac_is_push  = eac_is_bsr || eac_is_jsr;
+wire wr_stall     = eac_valid && eac_is_push && l1_wr_busy;
 
-assign eaf_stall = stall_in || mem_issue;
+assign eaf_stall = stall_in || mem_issue || wr_stall;
 assign raddr_a    = eac_src_reg;
 assign raddr_b    = eac_dest_reg;
 
@@ -223,11 +272,21 @@ wire [31:0] operand_b = fwd_b_from_ex ? ex_fwd_data : rdata_b;
 // decode emitting the right eac_imm.
 wire [31:0] ea_target = operand_a + eac_imm;
 
+// BSR/JSR's push address AND the new A7 value to commit are the SAME
+// expression, from operand_b (A7's current value via port B, decode having
+// set eac_dest_reg to A7's unified index for both -- see header).
+wire [31:0] push_addr = operand_b - 32'd4;
+
 // Driven unconditionally, same "compute always, gate consumption" precedent
-// as raddr_b -- harmless when eac_is_mem_src is false, nothing reads l1_q_b
-// that cycle. PC_RESET-relative to match ap040_inst_fetch.v's own L1
-// addressing -- see header.
-assign l1_addr_b = (ea_target - PC_RESET) >> 1;
+// as raddr_b -- harmless when neither eac_is_mem_src/eac_is_jmp nor
+// eac_is_push is set, nothing reads l1_q_b or l1_wr_busy that cycle.
+// PC_RESET-relative to match ap040_inst_fetch.v's own L1 addressing -- see
+// header. Selects between a READ target (memory-source or JMP/JSR's
+// redirect) and the PUSH address -- mutually exclusive by construction.
+wire [31:0] l1_addr_word = eac_is_push ? push_addr : ea_target;
+assign l1_addr_b = (l1_addr_word - PC_RESET) >> 1;
+assign l1_wren_b = eac_valid && eac_is_push;
+assign l1_data_b = eac_next_pc;
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -244,6 +303,8 @@ always @(posedge clk) begin
 		eaf_is_scc     <= 1'b0;
 		eaf_is_dbcc    <= 1'b0;
 		eaf_is_jmp     <= 1'b0;
+		eaf_is_bsr     <= 1'b0;
+		eaf_is_jsr     <= 1'b0;
 		eaf_cond       <= 4'h0;
 		mem_pending    <= 1'b0;
 	end else if (ce) begin
@@ -267,18 +328,33 @@ always @(posedge clk) begin
 				eaf_is_branch  <= eac_is_branch;
 				eaf_is_scc     <= eac_is_scc;
 				eaf_is_dbcc    <= eac_is_dbcc;
-				eaf_is_jmp     <= 1'b0;   // a mem-source instruction is never also a JMP
+				eaf_is_jmp     <= 1'b0;   // a mem-source instruction is never also a JMP/BSR/JSR
+				eaf_is_bsr     <= 1'b0;
+				eaf_is_jsr     <= 1'b0;
 				eaf_cond       <= eac_cond;
 				mem_pending    <= 1'b0;
+			end else if (wr_stall) begin
+				// Waiting for l1_wr_busy to clear -- see header. eac_* stays
+				// frozen (eaf_stall propagates backward), so this re-evaluates
+				// identically next cycle with the SAME push request still
+				// asserted, until the port is free.
+				eaf_valid <= 1'b0;
 			end else begin
 				eaf_valid      <= eac_valid;
 				eaf_pc         <= eac_pc;
 				eaf_next_pc    <= eac_next_pc;
 				eaf_dest_reg   <= eac_dest_reg;
-				// JMP: route the computed EA itself, not the register value
-				// alone -- see header.
-				eaf_operand_a  <= eac_is_jmp ? ea_target : operand_a;
-				eaf_operand_b  <= operand_b;
+				// JMP/JSR: route the computed EA itself, not the register
+				// value alone -- see header. BSR has no source read at all
+				// (operand_a is simply unused for it), so it falls through
+				// to the same default every register-direct instruction
+				// already used.
+				eaf_operand_a  <= (eac_is_jmp || eac_is_jsr) ? ea_target : operand_a;
+				// BSR/JSR: the NEW A7 value (== push_addr, the same
+				// expression already used for the write address) -- see
+				// header for why the decrement happens HERE, once, rather
+				// than being recomputed in ap040_execute.v.
+				eaf_operand_b  <= (eac_is_bsr || eac_is_jsr) ? push_addr : operand_b;
 				eaf_alu_op     <= eac_alu_op;
 				eaf_writes_reg <= eac_writes_reg;
 				eaf_writes_ccr <= eac_writes_ccr;
@@ -286,6 +362,8 @@ always @(posedge clk) begin
 				eaf_is_scc     <= eac_is_scc;
 				eaf_is_dbcc    <= eac_is_dbcc;
 				eaf_is_jmp     <= eac_is_jmp;
+				eaf_is_bsr     <= eac_is_bsr;
+				eaf_is_jsr     <= eac_is_jsr;
 				eaf_cond       <= eac_cond;
 			end
 		end

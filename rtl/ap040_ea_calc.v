@@ -1,12 +1,11 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 11: JMP (An),       //
-// JMP (d16,An))                                                            //
+// AP040_PIPE - MC68040-style pipelined core (milestone 13: BSR, JSR)       //
 //                                                                          //
 // ap040_ea_calc.v - EA-calc stage                                         //
 //                                                                          //
 // MOVEQ, register-direct MOVE.L/ADD.L, Bcc/BRA (any displacement width),   //
-// Scc, DBcc, and JMP all have no memory effective address to compute, so   //
-// this is still a pure pass-through -- it exists to occupy the pipeline-   //
+// Scc, DBcc, JMP, BSR, and JSR all have no memory effective address to     //
+// compute, so this is still a pure pass-through -- it exists to occupy the //
 // register slot a real address calculation will use once an EA mode that   //
 // actually needs arithmetic is added, rather than being spliced in later   //
 // and reshaping the pipeline. id_is_branch/id_is_scc/id_cond/              //
@@ -26,6 +25,12 @@
 // fetch's memory-access/stall logic (see its header) doesn't need to        //
 // change at all -- it already just consumes whatever address EA-calc        //
 // resolved.                                                                 //
+//                                                                          //
+// BSR/JSR (milestone 13, new) are the SAME story one level further: the     //
+// push address (A7-4) and the memory write itself are both computed and     //
+// issued entirely in ap040_ea_fetch.v, from id_dest_reg's register value    //
+// (port B) -- id_is_bsr/id_is_jsr just thread through here unchanged, same  //
+// as every other flag.                                                     //
 //                                                                          //
 // flush: when ap040_execute.v detects a mispredicted branch, everything     //
 // speculatively fetched behind it -- including whatever is sitting here -- //
@@ -56,6 +61,8 @@ module ap040_ea_calc
 	input             id_is_dbcc,
 	input             id_is_mem_src,
 	input             id_is_jmp,
+	input             id_is_bsr,
+	input             id_is_jsr,
 	input       [3:0] id_cond,
 
 	output            ea_stall,   // to ID: no local stall of its own yet
@@ -75,6 +82,8 @@ module ap040_ea_calc
 	output reg        eac_is_dbcc,
 	output reg        eac_is_mem_src,
 	output reg        eac_is_jmp,
+	output reg        eac_is_bsr,
+	output reg        eac_is_jsr,
 	output reg  [3:0] eac_cond
 );
 
@@ -97,6 +106,8 @@ always @(posedge clk) begin
 		eac_is_dbcc      <= 1'b0;
 		eac_is_mem_src   <= 1'b0;
 		eac_is_jmp       <= 1'b0;
+		eac_is_bsr       <= 1'b0;
+		eac_is_jsr       <= 1'b0;
 		eac_cond         <= 4'h0;
 	end else if (ce) begin
 		if (flush) begin
@@ -117,6 +128,8 @@ always @(posedge clk) begin
 			eac_is_dbcc      <= id_is_dbcc;
 			eac_is_mem_src   <= id_is_mem_src;
 			eac_is_jmp       <= id_is_jmp;
+			eac_is_bsr       <= id_is_bsr;
+			eac_is_jsr       <= id_is_jsr;
 			eac_cond         <= id_cond;
 		end
 	end

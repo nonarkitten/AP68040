@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 8: DBcc)            //
+// AP040_PIPE - MC68040-style pipelined core (milestone 13: BSR, JSR)       //
 //                                                                          //
 // ap040_pipe_core.v - top level: wires IF/ID/EA-calc/EA-fetch/EX/WB into a //
 // real six-stage pipeline with a synchronous stall/flush chain,            //
@@ -100,6 +100,17 @@
 // says so; see ap040_execute.v's header). ex_mispredict/ex_recovery_pc are    //
 // reused completely unchanged: DBcc's "don't branch" outcomes are, from       //
 // this file's point of view, indistinguishable from a not-taken Bcc.         //
+//                                                                          //
+// Milestone 13 adds BSR/JSR and, with them, this pipeline's first real        //
+// memory WRITE: u_l1's port B (data_b/wren_b) is no longer tied off, driven    //
+// instead by ap040_ea_fetch.v's own l1_data_b/l1_wren_b outputs -- the SAME     //
+// port A/JMP/JSR's reads already share, since an instruction is never both      //
+// a read and a push at once. *_is_bsr/*_is_jsr thread through the same           //
+// mechanical pass-through shape as *_is_jmp; the actual push logic (address,      //
+// data, stall) lives entirely in ap040_ea_fetch.v, and the A7 write reuses the     //
+// existing commit_reg path below unchanged (ap040_decode.v points its              //
+// eac_dest_reg at A7's unified index, same as any other register-writing            //
+// instruction) -- nothing new needed at this level for that half either.             //
 //--------------------------------------------------------------------------//
 
 module ap040_pipe_core
@@ -133,6 +144,7 @@ wire [31:0] id_imm;
 wire  [5:0] id_alu_op;
 wire        id_src_a_is_imm, id_writes_reg, id_writes_ccr;
 wire        id_is_branch, id_is_scc, id_is_dbcc, id_is_mem_src, id_is_jmp;
+wire        id_is_bsr, id_is_jsr;
 wire  [3:0] id_cond;
 // id_unimpl: decode's "opcode not recognized" bit. Not consumed past decode
 // yet -- nothing traps on it (writes_reg=0 already makes an unrecognized
@@ -148,6 +160,7 @@ wire [31:0] eac_imm;
 wire  [5:0] eac_alu_op;
 wire        eac_src_a_is_imm, eac_writes_reg, eac_writes_ccr;
 wire        eac_is_branch, eac_is_scc, eac_is_dbcc, eac_is_mem_src, eac_is_jmp;
+wire        eac_is_bsr, eac_is_jsr;
 wire  [3:0] eac_cond;
 
 wire        eaf_valid; wire [31:0] eaf_pc; wire [31:0] eaf_next_pc;
@@ -156,6 +169,7 @@ wire [31:0] eaf_operand_a, eaf_operand_b;
 wire  [5:0] eaf_alu_op;
 wire        eaf_writes_reg, eaf_writes_ccr;
 wire        eaf_is_branch, eaf_is_scc, eaf_is_dbcc, eaf_is_jmp;
+wire        eaf_is_bsr, eaf_is_jsr;
 wire  [3:0] eaf_cond;
 
 wire        exe_valid; wire [31:0] exe_pc;
@@ -279,13 +293,16 @@ ap040_pipe_regfile u_regfile
 //---------------------------------------------------------------------------
 
 // Unified L1. Port A is IF's (milestone 9a). Port B is EA-fetch's data
-// read (milestone 9b, new) -- write side (data_b/wren_b/wr_busy) still tied
-// off: nothing writes memory yet, reserved for a future store instruction
-// the same "reserved, not speculative" way raddr_b was until Scc needed it.
+// read (milestone 9b, MOVE.L/JMP/JSR) AND, since milestone 13, its write
+// (BSR/JSR's push) -- both directions driven by the SAME EA-fetch instance,
+// mutually exclusive per the always-one-instruction-at-a-time discipline
+// this pipeline already has.
 wire [L1_AW-1:0] l1_addr_a;
 wire      [15:0] l1_rdata_a;
 wire [L1_AW-1:0] l1_addr_b;
 wire       [31:0] l1_q_b;
+wire              l1_wren_b;
+wire       [31:0] l1_data_b;
 wire              l1_wr_busy;
 
 ap040_pipe_l1 #(
@@ -307,8 +324,8 @@ ap040_pipe_l1 #(
 	.q_a       (l1_rdata_a),
 
 	.address_b (l1_addr_b),
-	.data_b    (32'h0),
-	.wren_b    (1'b0),
+	.data_b    (l1_data_b),
+	.wren_b    (l1_wren_b),
 	.wr_busy   (l1_wr_busy),
 	.q_b       (l1_q_b)
 );
@@ -367,6 +384,8 @@ ap040_decode u_id
 	.id_is_dbcc      (id_is_dbcc),
 	.id_is_mem_src   (id_is_mem_src),
 	.id_is_jmp       (id_is_jmp),
+	.id_is_bsr       (id_is_bsr),
+	.id_is_jsr       (id_is_jsr),
 	.id_cond         (id_cond),
 	.id_unimpl       (id_unimpl)
 );
@@ -394,6 +413,8 @@ ap040_ea_calc u_eac
 	.id_is_dbcc       (id_is_dbcc),
 	.id_is_mem_src    (id_is_mem_src),
 	.id_is_jmp        (id_is_jmp),
+	.id_is_bsr        (id_is_bsr),
+	.id_is_jsr        (id_is_jsr),
 	.id_cond          (id_cond),
 
 	.ea_stall         (ea_stall),
@@ -413,6 +434,8 @@ ap040_ea_calc u_eac
 	.eac_is_dbcc      (eac_is_dbcc),
 	.eac_is_mem_src   (eac_is_mem_src),
 	.eac_is_jmp       (eac_is_jmp),
+	.eac_is_bsr       (eac_is_bsr),
+	.eac_is_jsr       (eac_is_jsr),
 	.eac_cond         (eac_cond)
 );
 
@@ -442,6 +465,8 @@ ap040_ea_fetch #(
 	.eac_is_dbcc      (eac_is_dbcc),
 	.eac_is_mem_src   (eac_is_mem_src),
 	.eac_is_jmp       (eac_is_jmp),
+	.eac_is_bsr       (eac_is_bsr),
+	.eac_is_jsr       (eac_is_jsr),
 	.eac_cond         (eac_cond),
 
 	.raddr_a          (raddr_a),
@@ -455,6 +480,9 @@ ap040_ea_fetch #(
 
 	.l1_addr_b        (l1_addr_b),
 	.l1_q_b           (l1_q_b),
+	.l1_wren_b        (l1_wren_b),
+	.l1_data_b        (l1_data_b),
+	.l1_wr_busy       (l1_wr_busy),
 
 	.eaf_stall        (eaf_stall),
 
@@ -471,6 +499,8 @@ ap040_ea_fetch #(
 	.eaf_is_scc       (eaf_is_scc),
 	.eaf_is_dbcc      (eaf_is_dbcc),
 	.eaf_is_jmp       (eaf_is_jmp),
+	.eaf_is_bsr       (eaf_is_bsr),
+	.eaf_is_jsr       (eaf_is_jsr),
 	.eaf_cond         (eaf_cond)
 );
 
@@ -494,6 +524,8 @@ ap040_execute u_ex
 	.eaf_is_scc       (eaf_is_scc),
 	.eaf_is_dbcc      (eaf_is_dbcc),
 	.eaf_is_jmp       (eaf_is_jmp),
+	.eaf_is_bsr       (eaf_is_bsr),
+	.eaf_is_jsr       (eaf_is_jsr),
 	.eaf_cond         (eaf_cond),
 
 	.ccr_in           (ccr_resolved),
