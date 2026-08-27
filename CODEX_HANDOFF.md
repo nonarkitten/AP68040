@@ -147,3 +147,30 @@ natural candidate -- reuses the existing multi-word decode gather) or
 `(An)+`/`-(An)` (needs the pipeline's first register WRITE originating from
 EA-calc/EA-fetch, not just EX) -- see `AP040_IMPLEMENTATION_PLAN.md`
 section 6 item 1.
+
+## 2026-08-27 (later still): milestone 10, MOVE.L (d16,An),Dn -- and a real bug
+
+Did `(d16,An)` next, per the note above. The EA arithmetic itself was easy
+(reused the existing gather machinery + `id_imm` as a general-purpose
+offset field). What actually mattered: this milestone's test was the FIRST
+to have a stall from one instruction's memory access overlap with a SECOND
+instruction's gather still assembling its extension word -- a combination
+milestone 9b's test never produced -- and that overlap exposed a real,
+already-shipped bug: `ap040_pipe_l1.v` port A had no stall-awareness at
+all, and would silently read one word PAST what `if_opcode` was supposed to
+keep presenting, the moment any stall outlasted a single cycle. Fixed with
+a proper `en_a` enable, matching `ap040_inst_fetch.v`'s own freeze
+condition exactly. Full writeup, including WHY milestone 9b's own test
+never caught it, is in `AP040_IMPLEMENTATION_PLAN.md` section 5a -- read it
+before touching `ap040_pipe_l1.v` or adding a new stall source; the general
+lesson (stalls must propagate to everything the frozen register
+combinationally feeds, not just the register itself) will matter again.
+
+All three new mechanisms this milestone touched (the redirect-suppression
+guard, the `id_imm` zero-fix, the `en_a` fix) were mutation-tested
+independently; all caught cleanly, and the `en_a` mutation reproduces the
+exact original bug's symptom. Full 11-file `run_pipe_tests.sh` green.
+
+Next: `(An)+`/`-(An)` (needs the pipeline's first EA-side register write)
+or start on indexed/absolute/PC-relative modes -- see
+`AP040_IMPLEMENTATION_PLAN.md` section 6 item 1.

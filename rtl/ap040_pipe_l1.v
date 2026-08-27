@@ -60,17 +60,46 @@
 // this default has no data-side consequence yet; revisit if/when a test    //
 // cares about a genuine zero-fill default for data.                       //
 //                                                                          //
-// Timing note (why this is a drop-in, not a stall-infrastructure change):  //
-// ap040_inst_fetch.v's own array read, before this milestone, was already  //
-// a registered (1-cycle-latency) read -- functionally identical to this    //
-// module's `q_a <= mem[address_a]`. Moving the storage out to a shared      //
-// module and having IF drive address_a combinationally (see its own        //
-// header) reproduces the EXACT same address-to-data latency IF already     //
-// had, so this is a like-for-like swap: every existing pipe testbench       //
-// passes unmodified in behavior (only the hierarchical poke path changed). //
-// The real timing decision -- combinational vs. a genuine stalled read for //
-// port B once EA-fetch actually consumes it -- is still open; see          //
-// AP040_IMPLEMENTATION_PLAN.md section 6.                                  //
+// Timing note (why this is a drop-in for the UNSTALLED case): ap040_inst_    //
+// fetch.v's own array read, before milestone 9a, was already a registered   //
+// (1-cycle-latency) read -- functionally identical to this module's own      //
+// `q_a <= mem[address_a]`. With nothing ever stalling (true through           //
+// milestone 9a), having IF drive address_a combinationally reproduces the     //
+// exact same address-to-data latency IF already had.                          //
+//                                                                          //
+// en_a (milestone 10, real bug fix, not a drop-in): a stall breaks the      //
+// assumption above. ap040_inst_fetch.v's internal `pc` register is ALWAYS   //
+// one step ahead of if_pc/if_opcode by design (pc = next fetch address,     //
+// if_pc/if_opcode = the word currently being presented, one cycle younger). //
+// When id_stall freezes if_pc (correctly holding the word decode still      //
+// needs), pc freezes too -- but at its OWN, already-one-step-further value. //
+// Before en_a existed, q_a had no idea any of this happened: it kept        //
+// registering mem[address_a] EVERY edge regardless, and since address_a is  //
+// combinationally address_a=f(pc), it kept reading the address pc had       //
+// ALREADY moved to -- one step past if_pc -- silently overwriting the word  //
+// if_opcode was supposed to keep presenting, one edge into the stall. A     //
+// real bug, first caught by tb_ap040_pipe_move_disp.v (its case B gather    //
+// needed the extension word held steady during a stall caused by an         //
+// EARLIER instruction's own memory access); tb_ap040_pipe_move_mem.v's own  //
+// stall never happened to land on anything but a harmless NOP, so this      //
+// shipped undetected in milestone 9b. Fixed by gating port A's registers    //
+// with en_a = ce && !id_stall (ap040_pipe_core.v wires it from the SAME     //
+// condition already gating ap040_inst_fetch.v's own if_pc/pc registers) --  //
+// when frozen, q_a now correctly HOLDS instead of free-running ahead of     //
+// what if_pc represents.                                                   //
+//                                                                          //
+// Port B has no equivalent bug and gained no equivalent enable: its         //
+// address (ap040_ea_fetch.v's l1_addr_b) is a direct combinational          //
+// function of ap040_ea_calc.v's OWN registered output, which already        //
+// freezes correctly on its own stall_in -- there is no separate,            //
+// independently-advancing "one step ahead" register driving it the way      //
+// IF's `pc` drives port A. If a future EA mode ever grows something like     //
+// a real prefetch queue on the data side, revisit this asymmetry rather      //
+// than assume it still holds.                                              //
+//                                                                          //
+// The other open question -- combinational vs. registered/stalled for       //
+// port B once EA-fetch consumes it -- was decided (registered+stalled) in    //
+// milestone 9b; see AP040_IMPLEMENTATION_PLAN.md section 5a.                 //
 //--------------------------------------------------------------------------//
 
 `include "ap040_pipe_defs.svh"
@@ -86,6 +115,7 @@ module ap040_pipe_l1
 	input      [AW-1:0]  address_a,
 	input      [DW-1:0]  data_a,
 	input                wren_a,
+	input                en_a,     // see header -- must match the requester's own stall
 	output reg [DW-1:0]  q_a,
 
 	// port B: 32-bit, addresses the HIGH word; low word is address_b+1 -- see
@@ -104,12 +134,14 @@ initial for (i = 0; i < (1<<AW); i = i + 1) mem[i] = `AP040_OP_NOP;
 wire [AW-1:0] address_b_lo = address_b + {{(AW-1){1'b0}}, 1'b1};
 
 always @(posedge clock) begin
-	if (wren_a) mem[address_a] <= data_a;
+	if (en_a) begin
+		if (wren_a) mem[address_a] <= data_a;
+		q_a <= mem[address_a];
+	end
 	if (wren_b) begin
 		mem[address_b]    <= data_b[31:16];
 		mem[address_b_lo] <= data_b[15:0];
 	end
-	q_a <= mem[address_a];
 	q_b <= {mem[address_b], mem[address_b_lo]};
 end
 

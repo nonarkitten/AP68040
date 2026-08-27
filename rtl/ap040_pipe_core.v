@@ -297,6 +297,11 @@ ap040_pipe_l1 #(
 	.address_a (l1_addr_a),
 	.data_a    (16'h0),
 	.wren_a    (1'b0),
+	// Must match ap040_inst_fetch.v's OWN if_pc/pc update condition exactly
+	// -- see ap040_pipe_l1.v's header (milestone 10 fix: without this, a
+	// stall lets q_a free-run past the word if_opcode is supposed to keep
+	// presenting).
+	.en_a      (ce && !id_stall),
 	.q_a       (l1_rdata_a),
 
 	.address_b (l1_addr_b),

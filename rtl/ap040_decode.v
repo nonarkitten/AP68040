@@ -1,16 +1,60 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 8: DBcc)            //
+// AP040_PIPE - MC68040-style pipelined core (milestone 10: MOVE.L          //
+// (d16,An),Dn)                                                             //
 //                                                                          //
 // ap040_decode.v - ID stage                                               //
 //                                                                          //
 // Recognizes NOP, MOVEQ, register-direct-to-register-direct MOVE.L,        //
 // register-direct ADD.L Dn,Dm, register-direct Scc.B Dn, DBcc Dn,<label>,  //
-// and the whole Bcc family including its 16-/32-bit displacement forms     //
-// (BRA included, as its "always true" special case -- see below). Anything //
-// else classifies as "unimplemented" and rides through the rest of the     //
-// pipeline as a safe bubble (id_writes_reg stays 0) rather than an error;  //
-// a later milestone replaces this with the real instruction-field decode   //
-// extracted from ap040_core.v's S_DECODE.                                  //
+// MOVE.L (An),Dn and MOVE.L (d16,An),Dn, and the whole Bcc family           //
+// including its 16-/32-bit displacement forms (BRA included, as its        //
+// "always true" special case -- see below). Anything else classifies as    //
+// "unimplemented" and rides through the rest of the pipeline as a safe     //
+// bubble (id_writes_reg stays 0) rather than an error; a later milestone   //
+// replaces this with the real instruction-field decode extracted from      //
+// ap040_core.v's S_DECODE.                                                 //
+//                                                                          //
+// MOVE.L (d16,An),Dn (milestone 10, new): a THIRD trigger onto the same     //
+// gather state machine DBcc added a second one to -- (d16,An) always         //
+// carries exactly one 16-bit extension word (the displacement), same        //
+// word-form shape as DBcc, so held_is_move_disp/held_dest_reg join            //
+// held_is_dbcc/held_reg rather than a parallel mechanism. Two things this     //
+// mode needed that neither Bcc nor DBcc did:                                 //
+//  - TWO different held registers, not one: dest (Dn) and src (An) are        //
+//    different registers here, unlike DBcc where the loop counter is both.    //
+//    held_dest_reg is new; held_reg (renamed in spirit, not in code, from      //
+//    "DBcc's loop counter") now generically means "the extra register field    //
+//    -- meaning depends on held_is_dbcc/held_is_move_disp".                    //
+//  - This gather must NOT trigger IF's speculative redirect. Every prior        //
+//    gather user (Bcc.W/L, DBcc) is something that MIGHT branch, so             //
+//    redirect_from_gather fired unconditionally on any gather completion         //
+//    through milestone 9. (d16,An)'s displacement is a MEMORY offset, not an     //
+//    instruction address -- redirecting IF there would be a real, silent         //
+//    correctness bug (confirmed by mutation-testing the guard back out; see       //
+//    ap040_execute.v-adjacent test notes / AP040_IMPLEMENTATION_PLAN.md).          //
+//    redirect_from_gather is now gated `&& !held_is_move_disp`.                    //
+//                                                                          //
+// The effective address itself needs no new machinery in ap040_ea_fetch.v:      //
+// EA = An + displacement, and id_imm already exists as a general-purpose         //
+// "extra 32-bit value" field (MOVEQ's immediate today) -- reused here to          //
+// carry the sign-extended displacement (gather_disp, the SAME wire Bcc/DBcc       //
+// already compute the identical way). ap040_ea_fetch.v's address computation       //
+// becomes `operand_a + eac_imm` unconditionally for every memory-source            //
+// instruction: for MOVE.L (An),Dn, eac_imm is 0 (see the id_imm fix below),         //
+// so the addition is a no-op; for (d16,An) it's the real displacement. One          //
+// formula, not a per-mode branch -- see ap040_ea_fetch.v's header.                  //
+//                                                                          //
+// id_imm fix (this milestone, affects the PLAIN (An) case too): the single-       //
+// word decode branch previously set id_imm unconditionally to the sign-             //
+// extended opcode LOW BYTE for every instruction, correct for MOVEQ and             //
+// harmless-because-unused for everything else -- until ap040_ea_fetch.v             //
+// started actually ADDING eac_imm to the address this milestone. MOVE.L             //
+// (An),Dn's own opcode low byte (e.g. 0x10 for (A0),D0) would have been              //
+// silently added to every plain-(An) address as a phantom displacement.              //
+// Fixed by explicitly zeroing id_imm for is_move_mem_l in that branch; caught         //
+// by re-running tb_ap040_pipe_move_mem.v (unaffected, since eac_imm is 0             //
+// either way for its address -- gap closed by mutation-testing the fix back           //
+// out, see the plan doc).                                                            //
 //                                                                          //
 // DBcc Dn,<label> (milestone 8, new): reuses the word-form gather this      //
 // module already built for Bcc.W -- DBcc always carries exactly one 16-bit //
@@ -235,18 +279,33 @@ wire is_move_mem_l = (if_opcode[15:12] == 4'b0010) &&
                       (if_opcode[8:6]  == 3'b000) &&
                       (if_opcode[5:3]  == 3'b010);
 
+// MOVE.L (d16,An),Dn: 0010 DDD 000 101 aaa -- same shape as is_move_mem_l
+// above, mode field 101 instead of 010 (verified against the same
+// ap040_core.v:5021-5052 MOVE decode -- d_mode==101 is SK_MEM there too,
+// just a different EA mode within the same general machinery). Always
+// carries exactly one 16-bit extension word (the displacement) -- routed
+// through the shared gather state machine below, not a parallel one.
+wire is_move_disp = (if_opcode[15:12] == 4'b0010) &&
+                     (if_opcode[8:6]  == 3'b000) &&
+                     (if_opcode[5:3]  == 3'b101);
+
 wire is_nop = (if_opcode == `AP040_OP_NOP);
 
 // Gather state -- see header comment. 0 = idle/normal decode cycle;
 // 1 = this cycle's if_opcode completes the gather; 2 = one more word
 // needed after this one (only ever set to 2 at gather start, long form).
-// held_is_dbcc/held_reg (new milestone 8) distinguish a DBcc gather from a
-// Bcc.W gather sharing this same state machine; held_reg is meaningless
-// (and unused) when held_is_dbcc is 0.
+// held_is_dbcc/held_reg (milestone 8) distinguish a DBcc gather from a
+// Bcc.W gather sharing this same state machine; held_is_move_disp/
+// held_dest_reg (milestone 10) add a third kind, MOVE.L (d16,An),Dn. held_reg
+// is "the extra register field" generically -- An for move-disp, the loop
+// counter for DBcc, meaningless when neither flag is set; held_dest_reg is
+// move-disp-only (Dn), meaningless otherwise.
 reg  [1:0]  ext_pending;
 reg         held_is_long;
 reg         held_is_dbcc;
+reg         held_is_move_disp;
 reg  [2:0]  held_reg;
+reg  [2:0]  held_dest_reg;
 reg  [31:0] held_pc;
 reg  [3:0]  held_cond;
 reg  [31:0] disp_acc;
@@ -264,9 +323,10 @@ wire [31:0] gather_disp = held_is_long ? {disp_acc[15:0], if_opcode}
 // it's fetched, gated to only when not already mid-gather -- if_opcode
 // during a gather cycle is data, not an opcode, and could coincidentally
 // bit-match the byte-form pattern), or on the exact cycle a word/long
-// gather completes.
+// gather completes -- EXCEPT a move-disp gather, whose displacement is a
+// memory offset, not a branch target (see header comment).
 wire redirect_from_byte   = if_valid && is_branch_byte && (ext_pending == 2'd0);
-wire redirect_from_gather = completing_gather;
+wire redirect_from_gather = completing_gather && !held_is_move_disp;
 
 assign id_redirect_valid = redirect_from_byte || redirect_from_gather;
 assign id_redirect_pc    = redirect_from_gather
@@ -294,7 +354,9 @@ always @(posedge clk) begin
 		ext_pending     <= 2'd0;
 		held_is_long    <= 1'b0;
 		held_is_dbcc    <= 1'b0;
+		held_is_move_disp <= 1'b0;
 		held_reg        <= 3'h0;
+		held_dest_reg   <= 3'h0;
 		held_pc         <= 32'h0;
 		held_cond       <= 4'h0;
 		disp_acc        <= 32'h0;
@@ -311,17 +373,26 @@ always @(posedge clk) begin
 					id_valid        <= 1'b1;
 					id_pc           <= held_pc;
 					id_next_pc      <= held_pc + 32'd2 + (held_is_long ? 32'd4 : 32'd2);
-					id_dest_reg     <= held_is_dbcc ? {1'b0, held_reg} : 4'h0;
-					id_src_reg      <= held_is_dbcc ? {1'b0, held_reg} : 4'h0;
-					id_imm          <= 32'h0;
+					id_dest_reg     <= held_is_dbcc ? {1'b0, held_reg} :
+					                    held_is_move_disp ? {1'b0, held_dest_reg} : 4'h0;
+					id_src_reg      <= held_is_dbcc ? {1'b0, held_reg} :
+					                    held_is_move_disp ? {1'b1, held_reg} : 4'h0;
+					// gather_disp is already the sign-extended displacement
+					// word (same wire Bcc/DBcc use for their target math) --
+					// move-disp reuses it verbatim as id_imm, no new
+					// arithmetic. Zero for every other gather kind, matching
+					// the plain-(An) id_imm fix below (this field is a real
+					// address offset now, not just MOVEQ's unused-elsewhere
+					// immediate -- see header).
+					id_imm          <= held_is_move_disp ? gather_disp : 32'h0;
 					id_alu_op       <= `AP040_ALU_MOVE;
 					id_src_a_is_imm <= 1'b0;
-					id_writes_reg   <= 1'b0;   // DBcc's write is dynamic -- see header
-					id_writes_ccr   <= 1'b0;
-					id_is_branch    <= !held_is_dbcc;
+					id_writes_reg   <= held_is_move_disp;   // DBcc's write is dynamic -- see header
+					id_writes_ccr   <= held_is_move_disp;
+					id_is_branch    <= !held_is_dbcc && !held_is_move_disp;
 					id_is_scc       <= 1'b0;
 					id_is_dbcc      <= held_is_dbcc;
-					id_is_mem_src   <= 1'b0;
+					id_is_mem_src   <= held_is_move_disp;
 					id_cond         <= held_cond;
 					id_unimpl       <= 1'b0;
 					ext_pending     <= 2'd0;
@@ -329,17 +400,20 @@ always @(posedge clk) begin
 					id_valid    <= 1'b0;
 					ext_pending <= ext_pending - 2'd1;
 				end
-			end else if (is_branch_word || is_branch_long || is_dbcc) begin
-				// Opcode word of a word/long-form branch, or a DBcc (always
-				// word-form): not a complete instruction yet -- hold what we
-				// know, start gathering.
-				id_valid     <= 1'b0;
-				held_pc      <= if_pc;
-				held_cond    <= if_opcode[11:8];
-				held_is_long <= is_branch_long;
-				held_is_dbcc <= is_dbcc;
-				held_reg     <= if_opcode[2:0];
-				ext_pending  <= is_branch_long ? 2'd2 : 2'd1;
+			end else if (is_branch_word || is_branch_long || is_dbcc || is_move_disp) begin
+				// Opcode word of a word/long-form branch, a DBcc, or a
+				// MOVE.L (d16,An),Dn (all word-form except long-branch): not
+				// a complete instruction yet -- hold what we know, start
+				// gathering.
+				id_valid      <= 1'b0;
+				held_pc       <= if_pc;
+				held_cond     <= if_opcode[11:8];
+				held_is_long  <= is_branch_long;
+				held_is_dbcc  <= is_dbcc;
+				held_is_move_disp <= is_move_disp;
+				held_reg      <= if_opcode[2:0];
+				held_dest_reg <= if_opcode[11:9];
+				ext_pending   <= is_branch_long ? 2'd2 : 2'd1;
 			end else begin
 				id_valid        <= if_valid;
 				id_pc           <= if_pc;
@@ -353,7 +427,11 @@ always @(posedge clk) begin
 				// (regfile read + EX-forward) doesn't need to know the
 				// difference, it just resolves whichever register this is.
 				id_src_reg      <= is_move_mem_l ? {1'b1, d_rn} : {1'b0, d_rn};
-				id_imm          <= {{24{if_opcode[7]}}, if_opcode[7:0]};
+				// Zeroed for is_move_mem_l (was the sign-extended opcode low
+				// byte for EVERY instruction here, harmless until
+				// ap040_ea_fetch.v started adding eac_imm to the address
+				// this milestone -- see header). Still meaningful for MOVEQ.
+				id_imm          <= is_move_mem_l ? 32'h0 : {{24{if_opcode[7]}}, if_opcode[7:0]};
 				id_alu_op       <= is_add_rr ? `AP040_ALU_ADD : `AP040_ALU_MOVE;
 				id_src_a_is_imm <= if_valid && is_moveq;
 				id_writes_reg   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_scc_rr || is_move_mem_l);

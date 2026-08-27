@@ -97,9 +97,10 @@ Completed milestones (`tb/run_pipe_tests.sh`, one file per milestone):
 | 8 | DBcc Dn,\<label\>, dynamic (runtime-conditioned) register write | `tb_ap040_pipe_dbcc.v` |
 | 9a | Unified L1 (`ap040_pipe_l1.v`) replaces IF's inline ROM; port B reserved for data | all of the above, unchanged behavior |
 | 9b | MOVE.L (An),Dn -- first memory read, first genuine pipeline stall | `tb_ap040_pipe_move_mem.v` |
+| 10 | MOVE.L (d16,An),Dn -- first real EA displacement arithmetic; found and fixed a real L1/stall bug (see below) | `tb_ap040_pipe_move_disp.v` |
 
-Register-direct/immediate/register-indirect only -- no arithmetic-EA modes
-((d16,An), indexed, absolute, PC-relative), no byte/word sizes, no writes to
+Register-direct/immediate/register-indirect(+displacement) only -- no
+indexed/absolute/PC-relative EA modes, no byte/word sizes, no writes to
 memory yet. See section 6.
 
 ## 5a. The unified-L1 decision (2026-08-27)
@@ -196,9 +197,76 @@ before this instruction reads it) -- mechanically covered by the reused
 `operand_a` mux, but nothing tests it yet since MOVEA/LEA don't exist to
 generate that producer. Revisit once they do.
 
+**DONE (milestone 10, 2026-08-27): MOVE.L (d16,An),Dn**, and with it a real,
+previously-shipped bug in the unified L1 itself -- found because this was
+the first test where a stall from one instruction's own memory access
+happened to overlap with a SECOND instruction's multi-word gather still in
+flight, a combination milestone 9b's test never produced.
+
+- **The EA arithmetic itself needed almost no new machinery.** `id_imm`
+  (previously only MOVEQ's immediate) now carries the sign-extended
+  displacement, reusing `ap040_decode.v`'s existing gather machinery (a
+  third trigger alongside Bcc.W and DBcc) and the same `gather_disp` wire
+  those two already compute. `ap040_ea_fetch.v`'s address became
+  `operand_a + eac_imm` unconditionally -- 0 for plain `(An)`, the real
+  displacement for `(d16,An)` -- one formula, not a per-mode branch.
+- **A real, needed guard**: every prior gather user (Bcc.W/L, DBcc) wants
+  IF's speculative redirect; `(d16,An)`'s "displacement" is a memory offset,
+  not a branch target, and would have hijacked IF into jumping to a garbage
+  address had `redirect_from_gather` not been explicitly gated
+  `&& !held_is_move_disp`. Confirmed load-bearing by mutation (dropping the
+  guard breaks the test, not just theoretically).
+- **A real, load-bearing companion fix**: `id_imm` was previously set to the
+  sign-extended opcode low byte for EVERY instruction (harmless when nothing
+  consumed it for non-MOVEQ cases). Once `ap040_ea_fetch.v` started actually
+  ADDING `eac_imm` to every memory address, the plain `(An)` case would have
+  silently added its own opcode's low byte as a phantom displacement.
+  Zeroed explicitly for `is_move_mem_l`; confirmed load-bearing by mutation
+  (breaks `tb_ap040_pipe_move_mem.v`, the milestone 9b test, when reverted).
+
+**The real find: `ap040_pipe_l1.v` port A had no enable, and would silently
+desynchronize from `if_opcode` across any stall longer than the instant it
+started.** `ap040_inst_fetch.v`'s internal `pc` register is *always* one
+step ahead of `if_pc`/`if_opcode` by design (normal single-stage-prefetch
+shape: `pc` is the next fetch address, `if_pc`/`if_opcode` is what's
+currently presented, one cycle younger). A stall correctly freezes both
+registers together -- but `pc` freezes at its own, already-more-advanced
+value. Port A's `q_a` had no idea any of this happened and kept
+`<= mem[address_a]` on every single clock edge regardless, and since
+`address_a` is a combinational function of `pc`, it kept reading the
+address `pc` had *already* moved to -- one word past what `if_opcode` was
+supposed to keep presenting -- silently overwriting it after just one
+stalled cycle. `tb_ap040_pipe_move_mem.v` never surfaced this because its
+own stall's collateral damage always landed on a harmless NOP; this
+milestone's case B (a second gather needing its extension word held steady
+across an EARLIER, unrelated instruction's memory stall) is what finally
+landed the overwrite on a real, non-inert word (`MOVEQ #9,D2`'s own
+opcode), turning silent corruption into a wrong register value. Fixed with
+a new `en_a` port on `ap040_pipe_l1.v`, wired from `ap040_pipe_core.v` as
+`ce && !id_stall` -- the EXACT condition already gating
+`ap040_inst_fetch.v`'s own `if_pc`/`pc` registers, so port A now freezes in
+lockstep with what it's supposed to represent instead of free-running past
+it. Confirmed load-bearing by mutation, reproducing the exact `4e714e71`
+garbage-NOP symptom the original bug produced. Port B needed no equivalent
+fix -- its address is a direct combinational function of `ap040_ea_calc.v`'s
+own already-stall-frozen output, not an independently-advancing register
+the way IF's `pc` is; see `ap040_pipe_l1.v`'s header for the full argument
+and the flag for revisiting it if that ever changes.
+
+General lesson, worth carrying forward: **a stalled pipeline register
+freezing correctly is not sufficient -- everything that register's value
+combinationally FEEDS must also stop advancing, including free-running
+memories with no natural concept of "stall."** This class of bug is
+specifically invisible to single-instruction tests and to tests whose
+stalls never overlap with another in-flight multi-cycle operation; it took
+a second gather colliding with a first instruction's own memory stall to
+surface it. Worth deliberately constructing scenarios like this again once
+more stall sources exist (a real L1 miss, a store's write-then-read
+hazard), not just testing one mechanism at a time in isolation.
+
 ## 5. Verification discipline (keep doing this)
 
-This is what has actually kept the pipeline correct across eight milestones
+This is what has actually kept the pipeline correct across ten milestones
 of rewrites; don't relax it for speed:
 
 - **Bit-exact opcode/semantics verification against `rtl_old`.** Every
@@ -224,17 +292,23 @@ of rewrites; don't relax it for speed:
   needs a mechanism that doesn't exist yet (e.g. TRAPcc and DBcc's
   odd-target fault both need exception delivery -- neither is silently
   half-implemented to avoid admitting that).
+- **Test stall OVERLAP, not just stalls in isolation.** Milestone 10 found a
+  real, already-shipped bug (`ap040_pipe_l1.v` port A free-running past a
+  stall -- see section 5a) that no single-mechanism test could have caught:
+  it only manifests when a stall from one in-flight operation collides with
+  a SECOND, independent multi-cycle operation (a gather) still assembling.
+  When adding a new stall source, deliberately construct a test where it
+  overlaps something else already in flight, not just a test of the new
+  stall by itself.
 
 ## 6. Remaining scope, roughly in dependency order
 
-1. **DONE (milestone 9b): first memory-referencing instruction**,
-   `MOVE.L (An),Dn` -- see section 5a. Next EA-mode candidates, in
-   increasing order of new machinery needed: `(An)+`/`-(An)` (An update --
-   needs a real WRITE to the regfile from EA-calc/EA-fetch, not just a
-   read, and a decision on WHEN the update commits relative to a fault),
-   `(d16,An)` (the first EA-calc arithmetic -- a second extension word,
-   reusing the multi-word gather machinery `ap040_decode.v` already has for
-   Bcc/DBcc), then indexed/absolute/PC-relative.
+1. **DONE (milestones 9b/10): `MOVE.L (An),Dn` and `MOVE.L (d16,An),Dn`** --
+   see section 5a. Next EA-mode candidates, in increasing order of new
+   machinery needed: `(An)+`/`-(An)` (An update -- needs a real WRITE to the
+   regfile from EA-calc/EA-fetch, not just a read, and a decision on WHEN
+   the update commits relative to a fault), then indexed/absolute/
+   PC-relative.
 2. **BSR / JMP / JSR.** BSR needs the pipeline's first real memory *write*
    (stack push) and RTS needs a read; JMP/JSR need real effective-address
    modes, not just displacement math. Natural follow-on once (1) lands.

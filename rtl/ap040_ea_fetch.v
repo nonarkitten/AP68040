@@ -1,5 +1,6 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 9b: MOVE.L (An),Dn) //
+// AP040_PIPE - MC68040-style pipelined core (milestone 10: MOVE.L          //
+// (d16,An),Dn)                                                             //
 //                                                                          //
 // ap040_ea_fetch.v - EA-fetch stage                                       //
 //                                                                          //
@@ -90,6 +91,16 @@
 // it or the "unified" memory silently stops being unified. This stage takes  //
 // the SAME PC_RESET parameter ap040_inst_fetch.v does (ap040_pipe_core.v     //
 // passes the identical value to both) rather than assuming address 0.        //
+//                                                                            //
+// MOVE.L (d16,An),Dn (milestone 10, new): needed NO changes to the mem_issue/ //
+// mem_complete FSM above -- ap040_decode.v now reuses id_imm to carry the      //
+// sign-extended displacement (0 for the plain (An) case), and this stage's     //
+// address computation became `operand_a + eac_imm` unconditionally (see        //
+// where l1_addr_b is assigned below) rather than a per-mode branch. The         //
+// gather that assembles the extension word happens entirely in                  //
+// ap040_decode.v, same as Bcc.W/DBcc -- this stage never knows a gather           //
+// happened, exactly the same "looks identical from EA-calc onward" property       //
+// those two established.                                                          //
 //                                                                            //
 // flush: when ap040_execute.v detects a mispredicted branch, everything     //
 // speculatively fetched behind it -- including whatever is sitting here -- //
@@ -188,11 +199,19 @@ wire [31:0] operand_a = eac_src_a_is_imm ? eac_imm :
 // current value" -- so it's a flat 2-way select.
 wire [31:0] operand_b = fwd_b_from_ex ? ex_fwd_data : rdata_b;
 
+// The effective address: operand_a (An's value, resolved by the mux above)
+// PLUS eac_imm (milestone 10: the sign-extended displacement for
+// MOVE.L (d16,An),Dn, or exactly 0 for plain MOVE.L (An),Dn -- see
+// ap040_decode.v's header for why id_imm is zeroed for the plain case).
+// One formula for both EA modes, not a per-mode branch -- adding a future
+// EA mode that also produces an address+offset shape (indexed, etc.) needs
+// no new logic here, just decode emitting the right eac_imm.
+//
 // Driven unconditionally, same "compute always, gate consumption" precedent
 // as raddr_b -- harmless when eac_is_mem_src is false, nothing reads l1_q_b
 // that cycle. PC_RESET-relative to match ap040_inst_fetch.v's own L1
 // addressing -- see header.
-assign l1_addr_b = (operand_a - PC_RESET) >> 1;
+assign l1_addr_b = (operand_a + eac_imm - PC_RESET) >> 1;
 
 always @(posedge clk) begin
 	if (!nreset) begin
