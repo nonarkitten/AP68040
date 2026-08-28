@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 15: supervisor state)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 16: RTS, RTE)       //
 //                                                                          //
 // ap040_execute.v - EX stage                                              //
 //                                                                          //
@@ -130,6 +130,9 @@ module ap040_execute
 	input             eaf_is_movec,
 	input             eaf_movec_dir,
 	input       [2:0] eaf_movec_sel,
+	input             eaf_is_rts,
+	input             eaf_is_rte,
+	input      [15:0] eaf_rte_sr_data,
 	input       [3:0] eaf_cond,
 
 	input       [4:0] ccr_in,    // already write-through-forwarded by
@@ -301,12 +304,19 @@ wire writes_reg_resolved = eaf_is_dbcc ? (eaf_valid && !cond_result) : eaf_write
 // illegal/TRAP are).
 wire exc_reaching_ex = eaf_is_trap || eaf_is_illegal || eaf_is_priv;
 
+// RTS/RTE (milestone 16) join the SAME unconditional-redirect club one
+// more time: RTS's popped PC (routed into eaf_operand_a exactly like
+// JMP/JSR's EA, see ap040_ea_fetch.v's header for why it reuses
+// mem_issue/mem_complete verbatim) and RTE's own popped PC (its 2-beat
+// sequencer's own finalize) are both targets decode could never have
+// speculated with either.
+wire redirect_always = eaf_is_jmp || eaf_is_jsr || eaf_is_rts || eaf_is_rte ||
+                        exc_reaching_ex;
+
 assign ex_mispredict   = eaf_valid && ((eaf_is_branch && !cond_result) ||
                                         (eaf_is_dbcc   && !dbcc_branch_taken) ||
-                                        eaf_is_jmp || eaf_is_jsr ||
-                                        exc_reaching_ex);
-assign ex_recovery_pc  = (eaf_is_jmp || eaf_is_jsr || exc_reaching_ex)
-                          ? eaf_operand_a : eaf_next_pc;
+                                        redirect_always);
+assign ex_recovery_pc  = redirect_always ? eaf_operand_a : eaf_next_pc;
 
 wire [31:0] scc_fill   = {24'd0, {8{cond_result}}};
 wire [31:0] scc_merged = {eaf_operand_b[31:8], scc_fill[7:0]};
@@ -327,16 +337,16 @@ wire [31:0] creg_read_value = (eaf_movec_sel == `AP040_CREG_SFC)  ? sfc_in  :
                                (eaf_movec_sel == `AP040_CREG_ISP)  ? isp_in  :
                                                                       msp_in;  // AP040_CREG_MSP
 
-// BSR/JSR/TRAP/illegal/priv: eaf_operand_b already IS the result -- ap040_
-// ea_fetch.v computed the new A7 value there (the same expression it used
-// for the push's write address), so this stage just selects it, the same
+// BSR/JSR/TRAP/illegal/priv/RTS/RTE: eaf_operand_b already IS the result --
+// ap040_ea_fetch.v computed the new A7 value there (the same expression it
+// used for the push/pop address), so this stage just selects it, the same
 // "precomputed elsewhere, EX only picks" shape scc_merged/dbcc_result
 // already use. No generic-ALU op is used for this (eaf_operand_a is busy
 // carrying the redirect/handler target and can't also carry a literal
-// decrement operand) -- see ap040_ea_fetch.v's header.
+// increment/decrement operand) -- see ap040_ea_fetch.v's header.
 wire [31:0] combined_result = eaf_is_scc  ? scc_merged :
                                eaf_is_dbcc ? dbcc_result :
-                               (eaf_is_bsr || eaf_is_jsr || exc_reaching_ex)
+                               (eaf_is_bsr || eaf_is_jsr || eaf_is_rts || eaf_is_rte || exc_reaching_ex)
                                  ? eaf_operand_b :
                                (eaf_is_movec && !eaf_movec_dir) ? creg_read_value :
                                                                     alu_result;
@@ -356,13 +366,20 @@ wire [31:0] combined_result = eaf_is_scc  ? scc_merged :
 // the fault -- computed here off eaf_sr_snapshot (ap040_ea_fetch.v's OWN
 // forwarded read of the SAME live SR, one cycle earlier, for the PUSHED
 // copy -- see its header for why threading it down, not re-reading a live
-// value here, is required, not just tidier). Mutually exclusive with
-// MOVE-to-SR's own write by construction (exc_reaching_ex and
-// eaf_is_movesr can never both be true -- a MOVE-to-SR that faults has its
-// eaf_is_movesr cleared by ap040_ea_fetch.v's exc_vec_done branch).
-wire        exe_writes_sr_c = eaf_valid && (eaf_is_movesr || exc_reaching_ex);
-wire [15:0] exe_sr_data_c   = exc_reaching_ex ? ((eaf_sr_snapshot & 16'h1FFF) | 16'h2000)
-                                               : eaf_operand_a[15:0];
+// value here, is required, not just tidier).
+//
+// RTE (milestone 16) is a THIRD source: restores the SR it just popped
+// (eaf_rte_sr_data, already masked with AP040_SR_MASK by
+// ap040_ea_fetch.v's own finalize step -- see its header), the architectural
+// inverse of the exception-entry case just above. All three sources are
+// mutually exclusive by construction: a MOVE-to-SR or RTE that faults a
+// privilege violation instead has its own eaf_is_movesr/eaf_is_rte cleared
+// by ap040_ea_fetch.v's exc_vec_done branch, so exc_reaching_ex never
+// overlaps with either.
+wire        exe_writes_sr_c = eaf_valid && (eaf_is_movesr || eaf_is_rte || exc_reaching_ex);
+wire [15:0] exe_sr_data_c   = exc_reaching_ex ? ((eaf_sr_snapshot & 16'h1FFF) | 16'h2000) :
+                               eaf_is_rte      ? eaf_rte_sr_data :
+                                                  eaf_operand_a[15:0];
 
 // MOVEC's write direction (milestone 15, new): writes ONE of the seven
 // control registers ap040_pipe_core.v now owns, selected by eaf_movec_sel
@@ -372,7 +389,30 @@ wire [15:0] exe_sr_data_c   = exc_reaching_ex ? ((eaf_sr_snapshot & 16'h1FFF) | 
 // Suppressed (like eaf_is_movec itself) whenever this MOVEC just faulted a
 // privilege violation instead -- ap040_ea_fetch.v already cleared
 // eaf_is_movec for that case, so eaf_movec_dir is simply never consulted.
-wire exe_writes_creg_c = eaf_valid && eaf_is_movec && eaf_movec_dir;
+//
+// RTE's A7 restore (milestone 16, new) ALSO routes through this same
+// direct-to-ISP/MSP path, deliberately NOT through the normal commit_reg/
+// A7-bank-selected write every other A7-touching instruction uses. A real
+// bug, found by this exact test failing, not by inspection: RTE's SR
+// restore (exe_writes_sr, above) and its A7 restore commit on the SAME
+// cycle, and ap040_pipe_core.v's sr_resolved -- correctly, per its own
+// milestone-15 fix -- makes a same-cycle SR write visible to THAT SAME
+// cycle's regfile bank-select. Going through commit_reg here would mean
+// RTE's OWN A7 write gets banked by the SR it is ITSELF in the middle of
+// restoring -- i.e. the NEW (post-restore) S bit, not the OLD one active
+// while the frame was actually being popped -- silently landing the
+// restored ISP/MSP value in USP instead whenever RTE returns to a
+// different mode than it ran in. Using exe_writes_creg's fixed ISP/MSP
+// target (selected off eaf_sr_snapshot[12], the M bit AS OF ea_fetch's own
+// cycle -- the OLD context, before this same instruction's restore lands)
+// sidesteps the race entirely, exactly the same "bypass the live bank,
+// write the supervisor stack directly" reasoning exc_sp_bank already
+// established for the exception-entry push.
+wire exe_writes_creg_c = (eaf_valid && eaf_is_movec && eaf_movec_dir) ||
+                          (eaf_valid && eaf_is_rte);
+wire  [2:0] exe_creg_sel_c  = eaf_is_rte ? (eaf_sr_snapshot[12] ? `AP040_CREG_MSP : `AP040_CREG_ISP)
+                                          : eaf_movec_sel;
+wire [31:0] exe_creg_data_c = eaf_is_rte ? eaf_operand_b : eaf_operand_a;
 
 assign ex_fwd_valid = eaf_valid && writes_reg_resolved;
 assign ex_fwd_dest  = eaf_dest_reg;
@@ -406,8 +446,8 @@ always @(posedge clk) begin
 		exe_writes_sr    <= exe_writes_sr_c;
 		exe_sr_data      <= exe_sr_data_c;
 		exe_writes_creg  <= exe_writes_creg_c;
-		exe_creg_sel     <= eaf_movec_sel;
-		exe_creg_data    <= eaf_operand_a;
+		exe_creg_sel     <= exe_creg_sel_c;
+		exe_creg_data    <= exe_creg_data_c;
 	end
 end
 

@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 15: supervisor state)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 16: RTS, RTE)       //
 //                                                                          //
 // ap040_ea_calc.v - EA-calc stage                                         //
 //                                                                          //
@@ -50,6 +50,14 @@
 // A7 for the exception's own push) are entirely ap040_ea_fetch.v's job -- see     //
 // its header.                                                                     //
 //                                                                          //
+// RTS / RTE (milestone 16, new): a sixth and seventh flavor, same story        //
+// again. RTS reuses id_is_mem_src (ap040_decode.v now sets it for RTS too,       //
+// same FSM MOVE.L (An),Dn already uses) so it needs NO new pass-through field       //
+// at all beyond id_is_rts itself, purely for ap040_execute.v's redirect/commit       //
+// classification. RTE gets its own new sequencer entirely in ap040_ea_fetch.v         //
+// (two reads, not one, plus a dynamic privilege check) -- this stage still has          //
+// nothing to compute for it either.                                                      //
+//                                                                          //
 // flush: when ap040_execute.v detects a mispredicted branch, everything     //
 // speculatively fetched behind it -- including whatever is sitting here -- //
 // must be discarded. Same shape as stall_in but forces a bubble instead     //
@@ -85,6 +93,8 @@ module ap040_ea_calc
 	input             id_is_illegal,
 	input             id_is_movesr,
 	input             id_is_movec,
+	input             id_is_rts,
+	input             id_is_rte,
 	input       [3:0] id_cond,
 
 	output            ea_stall,   // to ID: no local stall of its own yet
@@ -110,6 +120,8 @@ module ap040_ea_calc
 	output reg        eac_is_illegal,
 	output reg        eac_is_movesr,
 	output reg        eac_is_movec,
+	output reg        eac_is_rts,
+	output reg        eac_is_rte,
 	output reg  [3:0] eac_cond
 );
 
@@ -138,6 +150,8 @@ always @(posedge clk) begin
 		eac_is_illegal   <= 1'b0;
 		eac_is_movesr    <= 1'b0;
 		eac_is_movec     <= 1'b0;
+		eac_is_rts       <= 1'b0;
+		eac_is_rte       <= 1'b0;
 		eac_cond         <= 4'h0;
 	end else if (ce) begin
 		if (flush) begin
@@ -164,6 +178,8 @@ always @(posedge clk) begin
 			eac_is_illegal   <= id_is_illegal;
 			eac_is_movesr    <= id_is_movesr;
 			eac_is_movec     <= id_is_movec;
+			eac_is_rts       <= id_is_rts;
+			eac_is_rte       <= id_is_rte;
 			eac_cond         <= id_cond;
 		end
 	end

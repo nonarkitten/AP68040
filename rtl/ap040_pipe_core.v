@@ -1,6 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 15: supervisor      //
-// state)                                                                   //
+// AP040_PIPE - MC68040-style pipelined core (milestone 16: RTS, RTE)       //
 //                                                                          //
 // ap040_pipe_core.v - top level: wires IF/ID/EA-calc/EA-fetch/EX/WB into a //
 // real six-stage pipeline with a synchronous stall/flush chain,            //
@@ -130,6 +129,14 @@
 // header for where the privilege check itself happens (dynamically, off the         //
 // live S bit -- decode alone can't know it) and ap040_execute.v's header for         //
 // the exact SR-masking arithmetic exception entry applies.                            //
+//                                                                          //
+// Milestone 16 adds RTS/RTE, closing the loop BSR/JSR (the push) and                //
+// illegal/TRAP/priv (the exception-entry push) opened: this pipeline can now         //
+// actually RETURN, not just enter. No new top-level architectural state is            //
+// needed here at all -- both instructions reuse machinery this file already           //
+// wires (the regfile's commit_reg path for A7's new value, commit_sr for RTE's         //
+// popped SR) -- see ap040_ea_fetch.v's header for the new 2-beat pop sequencer          //
+// RTE needed and why RTS didn't (it reuses mem_issue/mem_complete verbatim).             //
 //--------------------------------------------------------------------------//
 
 `include "ap040_pipe_defs.svh"
@@ -172,6 +179,7 @@ wire        id_src_a_is_imm, id_writes_reg, id_writes_ccr;
 wire        id_is_branch, id_is_scc, id_is_dbcc, id_is_mem_src, id_is_jmp;
 wire        id_is_bsr, id_is_jsr, id_is_trap, id_is_illegal;
 wire        id_is_movesr, id_is_movec;
+wire        id_is_rts, id_is_rte;
 wire  [3:0] id_cond;
 
 wire        eac_valid; wire [31:0] eac_pc; wire [31:0] eac_next_pc;
@@ -182,6 +190,7 @@ wire        eac_src_a_is_imm, eac_writes_reg, eac_writes_ccr;
 wire        eac_is_branch, eac_is_scc, eac_is_dbcc, eac_is_mem_src, eac_is_jmp;
 wire        eac_is_bsr, eac_is_jsr, eac_is_trap, eac_is_illegal;
 wire        eac_is_movesr, eac_is_movec;
+wire        eac_is_rts, eac_is_rte;
 wire  [3:0] eac_cond;
 
 wire        eaf_valid; wire [31:0] eaf_pc; wire [31:0] eaf_next_pc;
@@ -195,6 +204,8 @@ wire        eaf_is_priv, eaf_is_movesr, eaf_is_movec;
 wire        eaf_movec_dir;
 wire  [2:0] eaf_movec_sel;
 wire [15:0] eaf_sr_snapshot;
+wire        eaf_is_rts, eaf_is_rte;
+wire [15:0] eaf_rte_sr_data;
 wire  [3:0] eaf_cond;
 
 wire        exe_valid; wire [31:0] exe_pc;
@@ -520,6 +531,8 @@ ap040_decode u_id
 	.id_is_illegal   (id_is_illegal),
 	.id_is_movesr    (id_is_movesr),
 	.id_is_movec     (id_is_movec),
+	.id_is_rts       (id_is_rts),
+	.id_is_rte       (id_is_rte),
 	.id_cond         (id_cond)
 );
 
@@ -552,6 +565,8 @@ ap040_ea_calc u_eac
 	.id_is_illegal    (id_is_illegal),
 	.id_is_movesr     (id_is_movesr),
 	.id_is_movec      (id_is_movec),
+	.id_is_rts        (id_is_rts),
+	.id_is_rte        (id_is_rte),
 	.id_cond          (id_cond),
 
 	.ea_stall         (ea_stall),
@@ -577,6 +592,8 @@ ap040_ea_calc u_eac
 	.eac_is_illegal   (eac_is_illegal),
 	.eac_is_movesr    (eac_is_movesr),
 	.eac_is_movec     (eac_is_movec),
+	.eac_is_rts       (eac_is_rts),
+	.eac_is_rte       (eac_is_rte),
 	.eac_cond         (eac_cond)
 );
 
@@ -612,6 +629,8 @@ ap040_ea_fetch #(
 	.eac_is_illegal   (eac_is_illegal),
 	.eac_is_movesr    (eac_is_movesr),
 	.eac_is_movec     (eac_is_movec),
+	.eac_is_rts       (eac_is_rts),
+	.eac_is_rte       (eac_is_rte),
 	.eac_cond         (eac_cond),
 
 	.sr_in            (sr_resolved),
@@ -658,6 +677,9 @@ ap040_ea_fetch #(
 	.eaf_movec_dir    (eaf_movec_dir),
 	.eaf_movec_sel    (eaf_movec_sel),
 	.eaf_sr_snapshot  (eaf_sr_snapshot),
+	.eaf_is_rts       (eaf_is_rts),
+	.eaf_is_rte       (eaf_is_rte),
+	.eaf_rte_sr_data  (eaf_rte_sr_data),
 	.eaf_cond         (eaf_cond)
 );
 
@@ -691,6 +713,9 @@ ap040_execute u_ex
 	.eaf_movec_dir    (eaf_movec_dir),
 	.eaf_movec_sel    (eaf_movec_sel),
 	.eaf_sr_snapshot  (eaf_sr_snapshot),
+	.eaf_is_rts       (eaf_is_rts),
+	.eaf_is_rte       (eaf_is_rte),
+	.eaf_rte_sr_data  (eaf_rte_sr_data),
 	.eaf_cond         (eaf_cond),
 
 	.ccr_in           (sr_resolved[4:0]),

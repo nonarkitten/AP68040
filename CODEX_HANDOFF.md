@@ -464,6 +464,62 @@ registers exist.
 Full 17-file `run_pipe_tests.sh` green (15 pipe-core tests + the new
 supervisor-state test + the standalone `l1_wbuf` test).
 
+## 2026-08-27 (later still): milestone 16, RTS, RTE
+
+User: RTS/RTE next -- closes the biggest gap milestone 15 left open (entry
+without a return path).
+
+- RTS is deliberately not a new mechanism: it reuses `mem_issue`/
+  `mem_complete` (MOVE.L (An),Dn's own FSM) verbatim -- a pop is
+  structurally just a 32-bit read from (A7) with the register hardcoded
+  instead of decoded from opcode bits. Only `mem_complete`'s
+  `eaf_operand_b` needed a new ternary, carrying A7's post-pop value
+  forward for the commit.
+- RTE needed real new machinery: a privilege check (RTE joins MOVE-to-SR/
+  MOVEC as a third dynamic-fault source, reusing `eac_is_priv`) gates a
+  genuinely supervisor RTE into its own 2-beat READ sequencer -- the
+  mirror image of the exception-entry sequencer's WRITE beats, reading
+  back the exact two dwords a format-$0 push wrote. Format $0 is assumed
+  unconditionally (this pipeline has never pushed anything else) -- a
+  real FMTERR fallback is deliberately deferred, not overlooked.
+- **A real architectural race, found by the test failing**: RTE's SR
+  restore and its A7 restore commit on the exact same cycle. Routing the
+  A7 write through the normal commit_reg/A7-bank-selected path meant
+  milestone 15's own `sr_resolved` fix made the SR restore visible to
+  that SAME cycle's bank selection -- RTE's own A7 write got banked
+  through the NEW (post-restore) S bit instead of the OLD one active
+  while the frame was actually being popped, silently landing the
+  restored ISP/MSP value in USP whenever RTE returned to a different mode
+  than it ran in. Fixed by routing RTE's A7 restore through the same
+  direct-to-ISP/MSP path (`exe_writes_creg`, the aux port) the exception
+  entry's own push already uses, bypassing the live bank entirely.
+- `tb_ap040_pipe_rts_rte.v` chains two round trips: plain BSR/RTS in
+  supervisor mode, then TRAP taken FROM user mode with RTE popping the
+  frame back out -- proving the frame lands on ISP not USP even though
+  the fault occurred in user mode (the exact scenario milestone 15's fix
+  targeted but had never been exercised with a real RTE consuming the
+  frame), PC and the full SR both restored exactly, and a third, post-RTE
+  BSR proving USP banking still works afterward.
+- Two testbench-construction bugs, not RTL: an early draft placed the
+  BSR/RTS return point immediately before the subroutine's own body,
+  so RTS's return fell straight through and re-entered the subroutine a
+  second time (caught by tracing, not inspection); the program had no
+  proper termination, so execution free-ran past the interesting part
+  into uninitialized memory and tripped an unrelated exception that
+  corrupted the final snapshot -- fixed with a `BRA.B <-2>` self-loop
+  instead of NOP padding.
+- Mutation testing: removing RTE's own commit path (caught); removing
+  RTS's `+4` new-A7 arithmetic (caught, cascade); removing RTE's SR-
+  restore data source -- **not caught on the first pass** (the wrong
+  fallback value coincidentally also read S=0 for this program's
+  addresses, and the test only checked bit 13) -- strengthened to assert
+  the full, exactly-known SR value instead, which then caught it cleanly;
+  forcing RTE's restore to always target USP instead of ISP/MSP (caught,
+  cascade). All four restored and diff-confirmed clean.
+
+Full 18-file `run_pipe_tests.sh` green (16 pipe-core tests + the new
+RTS/RTE test + the standalone `l1_wbuf` test).
+
 Next: format $2 (address error on odd JMP/JSR targets) -- see the entry
-above (unchanged from before this milestone). After that: `RTS`, TRAPcc,
-the DBcc branch-target parity check.
+above (unchanged from before this milestone). After that: TRAPcc, the
+DBcc branch-target parity check.

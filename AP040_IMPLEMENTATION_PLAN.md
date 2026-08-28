@@ -103,6 +103,7 @@ Completed milestones (`tb/run_pipe_tests.sh`, one file per milestone):
 | 13 | BSR (all 3 widths), JSR (An)/(d16,An) -- first real stack push, reusing the write buffer | `tb_ap040_pipe_bsr.v`, `tb_ap040_pipe_jsr.v` |
 | 14 | Exception entry: illegal instruction (vector 4), TRAP #n (vectors 32-47), format $0 (4-word) frame -- first exception-entry sequencer | `tb_ap040_pipe_exc.v` |
 | 15 | Supervisor state: real 16-bit SR, VBR/SFC/DFC/CACR, MOVEC, MOVE to SR, dynamic privilege violation (vector 8), USP/ISP/MSP banking | `tb_ap040_pipe_sup.v` |
+| 16 | RTS (reuses mem_issue/mem_complete verbatim), RTE (new 2-beat pop sequencer, format $0 only) -- the return half of BSR/JSR and illegal/TRAP/priv | `tb_ap040_pipe_rts_rte.v` |
 
 Register-direct/immediate/register-indirect(+displacement) only -- no
 indexed/absolute/PC-relative EA modes, no byte/word sizes yet (BSR/JSR now
@@ -703,6 +704,81 @@ registers exist.
 Full 17-file `run_pipe_tests.sh` green (15 pipe-core tests + the new
 supervisor-state test + the standalone `l1_wbuf` test).
 
+**DONE (milestone 16, 2026-08-27): RTS, RTE -- the return half of BSR/JSR's
+push and illegal/TRAP/priv's exception-entry push.** This pipeline can now
+actually return, not just enter -- closing the biggest gap flagged when
+milestone 15 shipped.
+
+- **RTS is deliberately not a new mechanism.** It reuses
+  `mem_issue`/`mem_complete` (MOVE.L (An),Dn's own FSM) verbatim -- a pop
+  is structurally just a 32-bit read from (A7) with the register hardcoded
+  instead of decoded from opcode bits. The only real addition is
+  `mem_complete`'s `eaf_operand_b`, which now also carries A7's NEW
+  (post-pop) value forward for the commit -- one ternary, not a new state
+  machine.
+- **RTE needed genuinely new machinery**: a privilege check (reusing
+  milestone 15's `eac_is_priv` mechanism -- RTE joins MOVE-to-SR/MOVEC as a
+  third dynamic-fault source) gates a real supervisor RTE into its own
+  2-beat READ sequencer, the mirror image of the exception-entry
+  sequencer's own WRITE beats, reading back the exact two dwords a
+  format-$0 push wrote. **Format $0 is assumed unconditionally** once the
+  pop completes -- this pipeline has no mechanism that could ever have
+  pushed anything else yet, so a real FMTERR fallback for an unrecognized
+  frame format is deliberately deferred, not overlooked (see section 6
+  item 2b).
+- **A real architectural race, found by the test failing, not by
+  inspection**: RTE's SR restore and its A7 restore commit on the exact
+  SAME cycle. Routing the A7 write through the normal `commit_reg`/A7-
+  bank-selected path (same as every other A7-touching instruction) meant
+  `ap040_pipe_core.v`'s `sr_resolved` -- correctly, per milestone 15's own
+  fix -- made the SR restore visible to THAT SAME cycle's bank selection,
+  so RTE's own A7 write got banked through the NEW (post-restore) S bit
+  instead of the OLD one active while the frame was actually being popped
+  -- silently landing the restored ISP/MSP value in USP whenever RTE
+  returned to a different mode than it ran in. Fixed by routing RTE's A7
+  restore through the SAME direct-to-ISP/MSP path (`exe_writes_creg`, the
+  aux port) the exception entry's own push already uses, bypassing the
+  live bank entirely -- not through `commit_reg` at all.
+- `tb_ap040_pipe_rts_rte.v` chains two round trips end to end: plain
+  BSR/RTS in supervisor mode (verified three ways -- the subroutine ran,
+  execution resumed at the exact correct return address, and ISP is
+  bit-for-bit back to its pre-call value), then TRAP taken FROM user mode
+  with RTE popping the frame back out (verified: the frame landed on ISP
+  not USP even though the fault occurred in user mode, exactly the
+  scenario milestone 15's own fix targeted but had never been exercised
+  with a REAL RTE consuming the frame afterward; PC and the full SR both
+  restored exactly; a third, post-RTE BSR proves USP banking still works
+  correctly afterward, and ISP ends up exactly back at its starting value
+  once both round trips are complete).
+- **Two real testbench-construction bugs, not RTL, both worth
+  remembering**: (1) an early draft placed the BSR/RTS return point
+  immediately before the subroutine's own body in memory -- RTS's return
+  fell straight through and re-entered the subroutine a second time,
+  caught by tracing cycle-by-cycle, not by inspection. (2) the program had
+  no proper termination after its interesting part finished: plain NOP
+  padding let execution free-run past it, off the end into uninitialized
+  (illegal-instruction) memory, tripping an UNRELATED exception that
+  corrupted the final ISP/USP/register snapshot before the test ever
+  checked it. Fixed with a tight `BRA.B <-2>` self-loop instead of NOP
+  padding -- the established fix is durable regardless of how generous a
+  future test's cycle budget gets, where a fixed NOP count is not.
+- **Mutation testing**: removing RTE's own commit path from
+  `exe_writes_creg_c` (caught -- ISP never restored). Removing RTS's `+4`
+  new-A7 arithmetic (caught, with an instructive cascade through the
+  following TRAP push). Removing RTE's SR-restore data source from
+  `exe_sr_data_c` -- **not caught on the first pass**: the wrong fallback
+  value (the popped PC's low 16 bits) happened to also read S=0 for this
+  program's specific addresses, and the test was only checking `dbg_sr[13]`,
+  not the full register. Strengthened to assert the exact known SR value
+  (`16'h0000`) instead of one bit, which then caught it cleanly -- a
+  genuine improvement to the test, not a workaround, and now a permanent
+  part of the suite. Forcing RTE's restore to always target USP instead of
+  ISP/MSP -- caught with a cascade through the rest of the program. All
+  four restored and diff-confirmed clean.
+
+Full 18-file `run_pipe_tests.sh` green (16 pipe-core tests + the new
+RTS/RTE test + the standalone `l1_wbuf` test).
+
 ## 5. Verification discipline (keep doing this)
 
 This is what has actually kept the pipeline correct across twelve milestones
@@ -810,13 +886,18 @@ of rewrites; don't relax it for speed:
    **VBR exists but isn't consulted yet** -- vector fetch still uses the
    PC_RESET-relative convention milestone 14 established; wiring a
    settable VBR into the actual vector-fetch address is separate,
-   deferred work. Also still deferred: **TRAPcc**, **DBcc's
-   branch-target parity check**, **CHK**/**zero-divide** (no such
-   instructions exist yet), **trace**, **RTE** (the return path --
-   everything above is entry-only so far, verified by reading pushed
-   frame contents directly out of `ap040_pipe_l1.v`'s array, the same
-   style BSR/JSR's own tests already use, not by actually returning), and
-   **bus/access-fault format $7** (needs a real BCU/MMU, explicitly
+   deferred work. **DONE (milestone 16): `RTS`, `RTE`** -- the return path
+   now exists (RTS reuses `mem_issue`/`mem_complete` verbatim; RTE gets its
+   own 2-beat pop sequencer, format $0 only), proven with a real, chained
+   round trip (BSR/RTS, then TRAP-from-user-mode/RTE) rather than just
+   inspecting pushed frame contents -- see the writeup above section 5,
+   including a real same-cycle SR/A7-restore race it caught and fixed.
+   RTE's own format-$0-only assumption inherits format $2's own deferral
+   above -- an RTE popping a frame this pipeline could never have pushed
+   (anything but format $0) has no FMTERR fallback yet, same reasoning.
+   Also still deferred: **TRAPcc**, **DBcc's branch-target parity check**,
+   **CHK**/**zero-divide** (no such instructions exist yet), **trace**,
+   and **bus/access-fault format $7** (needs a real BCU/MMU, explicitly
    deferred with that milestone per section 5's write-buffer note).
 3. **Byte/word-sized ALU ops and MOVE** (current pipeline is Long-only
    throughout `ap040_pipe_alu.v`'s size port is already there and unused).

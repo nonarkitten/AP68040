@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 15: supervisor state)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 16: RTS, RTE)       //
 //                                                                          //
 // ap040_decode.v - ID stage                                               //
 //                                                                          //
@@ -303,6 +303,8 @@ module ap040_decode
 	output reg        id_is_illegal,
 	output reg        id_is_movesr,
 	output reg        id_is_movec,
+	output reg        id_is_rts,
+	output reg        id_is_rte,
 	output reg  [3:0] id_cond
 );
 
@@ -416,6 +418,23 @@ wire is_jsr_disp   = is_jsr_opcode && (if_opcode[5:3] == 3'b101);
 // (...011), so no overlap is possible with either.
 wire is_trap = (if_opcode[15:4] == 12'h4E4);
 
+// RTS / RTE (milestone 16, new): the "other half" of BSR/JSR's push and
+// illegal/TRAP/priv's exception-entry push, respectively -- both are pure
+// A7-pop instructions with no register field in the opcode at all (unlike
+// every OTHER A7-touching instruction so far), so id_dest_reg/id_src_reg
+// are both hardcoded to A7 (4'd15) rather than derived from if_opcode
+// bits. RTS reuses ap040_ea_fetch.v's existing mem_issue/mem_complete FSM
+// verbatim (id_is_mem_src=1, same as MOVE.L (An),Dn) -- its "read" is a
+// single 32-bit pop, structurally identical to a memory-source MOVE
+// reading from (An), just with An hardcoded to A7 and the popped value
+// becoming a PC redirect (ex_recovery_pc) instead of a GPR result. RTE
+// needs genuinely new machinery instead (id_is_mem_src stays 0 for it):
+// TWO reads (SR+PC, then format), not one, plus a DYNAMIC privilege
+// check (RTE is supervisor-only, verified against ap040_core.v's `if
+// (!sr_s) go_priv` on its own dispatch) that must take priority over
+// attempting the pop at all -- see ap040_ea_fetch.v's header for the new
+// sequencer and ap040_execute.v's for the SR-restore commit path.
+//
 // MOVE to SR, register-direct source only: 0100 0110 11 000 rrr
 // (0x46C0-0x46C7) -- see header. Privileged; the actual privilege check is
 // DYNAMIC (this stage has no visibility into the live S bit), so it happens
@@ -456,6 +475,19 @@ wire  [2:0] movec_sel_code = (movec_raw_sel == 12'h000) ? `AP040_CREG_SFC  :
                                                             `AP040_CREG_MSP;  // 12'h803
 wire  [3:0] movec_gpr = {if_opcode[15], if_opcode[14:12]};
 
+// RTS/RTE (milestone 16): single fixed opcodes, no gather, no register
+// field at all -- unlike every other A7-touching instruction so far, the
+// register these decrement/increment isn't encoded anywhere in the
+// opcode, it's always A7. RTS: 0100 1110 0111 0101 (0x4E75). RTE:
+// 0100 1110 0111 0011 (0x4E73) -- one bit different from RTS (bit1),
+// verified against ap040_core.v's own casez arms (`6'b110101`/
+// `6'b110011` within the same 0x4E7x "misc" group MOVEC also lives in).
+// RTE is privileged (`if (!sr_s) go_priv` in ap040_core.v); RTS is not --
+// see ap040_ea_fetch.v's header for where that dynamic check actually
+// happens, same mechanism MOVEC/MOVE-to-SR already established.
+wire is_rts = (if_opcode == 16'h4E75);
+wire is_rte = (if_opcode == 16'h4E73);
+
 wire is_nop = (if_opcode == `AP040_OP_NOP);
 
 // Illegal instruction: precisely what none of the above (nor NOP/MOVEQ/
@@ -472,7 +504,7 @@ wire is_nop = (if_opcode == `AP040_OP_NOP);
 wire is_illegal = !is_nop && !is_moveq && !is_move_rr && !is_add_rr &&
                    !is_branch_byte && !is_scc_rr && !is_move_mem_l &&
                    !is_jmp_an && !is_bsr_byte && !is_jsr_an && !is_trap &&
-                   !is_movesr && !is_movec_opcode;
+                   !is_movesr && !is_movec_opcode && !is_rts && !is_rte;
 
 // Gather state -- see header comment. 0 = idle/normal decode cycle;
 // 1 = this cycle's if_opcode completes the gather; 2 = one more word
@@ -572,6 +604,8 @@ always @(posedge clk) begin
 		id_is_illegal   <= 1'b0;
 		id_is_movesr    <= 1'b0;
 		id_is_movec     <= 1'b0;
+		id_is_rts       <= 1'b0;
+		id_is_rte       <= 1'b0;
 		id_cond         <= 4'h0;
 		ext_pending     <= 2'd0;
 		held_is_long    <= 1'b0;
@@ -668,6 +702,8 @@ always @(posedge clk) begin
 					id_is_illegal   <= movec_illegal_gather;
 					id_is_movesr    <= 1'b0;
 					id_is_movec     <= held_is_movec && !movec_illegal_gather;
+					id_is_rts       <= 1'b0;
+					id_is_rte       <= 1'b0;
 					id_cond         <= held_cond;
 					ext_pending     <= 2'd0;
 				end else begin
@@ -702,7 +738,7 @@ always @(posedge clk) begin
 				id_pc           <= if_pc;
 				id_next_pc      <= if_pc + 32'd2;
 				id_dest_reg     <= is_scc_rr ? {1'b0, d_rn} :
-				                    (is_bsr_byte || is_jsr_an || is_trap || is_illegal || is_movesr) ? 4'd15 : {1'b0, d_reg9};
+				                    (is_bsr_byte || is_jsr_an || is_trap || is_illegal || is_movesr || is_rts || is_rte) ? 4'd15 : {1'b0, d_reg9};
 				// is_move_mem_l/is_jmp_an/is_jsr_an's src_reg is An, not Dn
 				// -- the unified index's top bit (8+n vs 0+n) is the ONLY
 				// thing that distinguishes "read this register's value as
@@ -715,26 +751,44 @@ always @(posedge clk) begin
 				// above), so it's simply absent from this OR-chain. TRAP/
 				// illegal need no source read either -- same reasoning as
 				// BSR.
-				id_src_reg      <= (is_move_mem_l || is_jmp_an || is_jsr_an) ? {1'b1, d_rn} : {1'b0, d_rn};
-				// Zeroed for is_move_mem_l/is_jmp_an/is_jsr_an (was the
-				// sign-extended opcode low byte for EVERY instruction here,
-				// harmless until ap040_ea_fetch.v started adding eac_imm to
-				// the address for memory-source instructions -- see
-				// header). Still meaningful for MOVEQ. TRAP repurposes this
-				// same general-purpose field for its actual vector NUMBER
-				// (32+n, not just n -- ap040_ea_fetch.v consumes it as-is,
-				// no +32 needed downstream) -- see header.
-				id_imm          <= (is_move_mem_l || is_jmp_an || is_jsr_an) ? 32'h0 :
+				// RTS/RTE need A7 on port A too (not just port B, unlike
+				// BSR/TRAP/illegal/MOVE-to-SR/MOVEC-write, which never read
+				// A7's value for anything besides the push/exception-frame
+				// address) -- they READ A7 to compute where to pop FROM,
+				// the same way MOVE.L (An),Dn reads An to compute where to
+				// read from, just with the register hardcoded instead of
+				// coming from opcode bits. See ap040_ea_fetch.v's header
+				// for why RTS deliberately reuses that exact mem_issue/
+				// mem_complete path (id_is_mem_src below) instead of
+				// getting its own sequencer the way RTE needs.
+				id_src_reg      <= (is_move_mem_l || is_jmp_an || is_jsr_an) ? {1'b1, d_rn} :
+				                    (is_rts || is_rte) ? 4'd15 : {1'b0, d_rn};
+				// Zeroed for is_move_mem_l/is_jmp_an/is_jsr_an/is_rts/is_rte
+				// (was the sign-extended opcode low byte for EVERY
+				// instruction here, harmless until ap040_ea_fetch.v started
+				// adding eac_imm to the address for memory-source
+				// instructions -- see header). Still meaningful for MOVEQ.
+				// TRAP repurposes this same general-purpose field for its
+				// actual vector NUMBER (32+n, not just n -- ap040_ea_fetch.v
+				// consumes it as-is, no +32 needed downstream) -- see header.
+				id_imm          <= (is_move_mem_l || is_jmp_an || is_jsr_an || is_rts || is_rte) ? 32'h0 :
 				                    is_trap ? (32'd32 + {28'd0, if_opcode[3:0]}) :
 				                              {{24{if_opcode[7]}}, if_opcode[7:0]};
 				id_alu_op       <= is_add_rr ? `AP040_ALU_ADD : `AP040_ALU_MOVE;
 				id_src_a_is_imm <= if_valid && is_moveq;
-				id_writes_reg   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_scc_rr || is_move_mem_l || is_bsr_byte || is_jsr_an || is_trap || is_illegal);
+				id_writes_reg   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_scc_rr || is_move_mem_l || is_bsr_byte || is_jsr_an || is_trap || is_illegal || is_rts || is_rte);
 				id_writes_ccr   <= if_valid && (is_moveq || is_move_rr || is_add_rr || is_move_mem_l);
 				id_is_branch    <= if_valid && is_branch_byte;
 				id_is_scc       <= if_valid && is_scc_rr;
 				id_is_dbcc      <= 1'b0;
-				id_is_mem_src   <= if_valid && is_move_mem_l;
+				// RTS reuses the SAME mem_issue/mem_complete FSM MOVE.L
+				// (An),Dn already built -- see ap040_ea_fetch.v's header --
+				// so it needs id_is_mem_src just like is_move_mem_l does.
+				// RTE deliberately does NOT: it needs its own 2-beat
+				// sequencer (SR+PC+format, not a single 32-bit value), and
+				// (unlike RTS) a dynamic privilege check that must take
+				// priority over any read at all.
+				id_is_mem_src   <= if_valid && (is_move_mem_l || is_rts);
 				id_is_jmp       <= if_valid && is_jmp_an;
 				id_is_bsr       <= if_valid && is_bsr_byte;
 				id_is_jsr       <= if_valid && is_jsr_an;
@@ -742,6 +796,8 @@ always @(posedge clk) begin
 				id_is_illegal   <= if_valid && is_illegal;
 				id_is_movesr    <= if_valid && is_movesr;
 				id_is_movec     <= 1'b0;   // MOVEC never reaches this branch -- it always gathers
+				id_is_rts       <= if_valid && is_rts;
+				id_is_rte       <= if_valid && is_rte;
 				id_cond         <= if_opcode[11:8];
 			end
 		end

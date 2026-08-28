@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 15: supervisor state)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 16: RTS, RTE)       //
 //                                                                          //
 // ap040_ea_fetch.v - EA-fetch stage                                       //
 //                                                                          //
@@ -221,7 +221,25 @@
 // write itself (when NOT faulting) is entirely ap040_execute.v's job -- this stage                     //
 // just threads eaf_is_movesr/eaf_is_movec/eaf_movec_dir/eaf_movec_sel through                           //
 // unchanged, the same mechanical pass-through every other classification flag gets.                      //
+//                                                                                          //
+// RTS / RTE (milestone 16, new): RTS is deliberately NOT a new mechanism -- it              //
+// reuses mem_issue/mem_complete VERBATIM (ap040_decode.v sets eac_is_mem_src for            //
+// it, same as MOVE.L (An),Dn), since a pop is structurally just a 32-bit read from            //
+// (A7) with the register hardcoded instead of decoded from opcode bits. The ONLY              //
+// addition is mem_complete's eaf_operand_b, which now also has to carry A7's NEW               //
+// (post-pop) value forward for the commit -- one ternary, not a new FSM. RTE is                 //
+// genuinely new: a privilege-violating RTE (checked exactly like MOVE-to-SR/MOVEC,                //
+// via eac_is_priv -- see above) never reaches its own machinery at all, redirected                 //
+// into the SAME exception-entry sequencer instead; a supervisor RTE gets its own 2-                 //
+// beat READ sequencer (ret_ph/ret_pending/ret_dword0), the mirror image of the                       //
+// exception-entry sequencer's own WRITE beats, reading back the exact two dwords a                    //
+// format-$0 push wrote. Format $0 is assumed unconditionally once the pop completes --                 //
+// this pipeline has no mechanism that could ever have pushed anything else, so a real                   //
+// FMTERR fallback for an unrecognized frame format is deliberately deferred, not                         //
+// forgotten -- see AP040_IMPLEMENTATION_PLAN.md.                                                          //
 //--------------------------------------------------------------------------//
+
+`include "ap040_pipe_defs.svh"
 
 module ap040_ea_fetch
 #(
@@ -256,6 +274,8 @@ module ap040_ea_fetch
 	input             eac_is_illegal,
 	input             eac_is_movesr,
 	input             eac_is_movec,
+	input             eac_is_rts,
+	input             eac_is_rte,
 	input       [3:0] eac_cond,
 
 	// Architectural SR (milestone 15: widened from a 5-bit CCR-only port to
@@ -323,6 +343,16 @@ module ap040_ea_fetch
 	// cycle later, which would close a combinational loop through its own
 	// EX-forward output -- see its header.
 	output reg [15:0] eaf_sr_snapshot,
+	output reg        eaf_is_rts,
+	output reg        eaf_is_rte,
+	// RTE's popped SR (masked, format-$0-frame's word0 high half) --
+	// ap040_execute.v's new commit source for restoring it, same shape as
+	// eaf_sr_snapshot above but this one's a REAL architectural value
+	// being adopted, not just a forwarded read -- see ap040_execute.v's
+	// header for why it needs its own field rather than reusing
+	// eaf_operand_a/b (both already busy carrying the redirect target and
+	// the new A7 value).
+	output reg [15:0] eaf_rte_sr_data,
 	output reg  [3:0] eaf_cond
 );
 
@@ -353,7 +383,7 @@ reg       exc_vec_pending;
 // which doesn't exist until here. eac_is_priv_capable is what
 // ap040_decode.v recognized; eac_is_priv is whether it actually fires THIS
 // cycle -- see header for why the check couldn't happen any earlier.
-wire eac_is_priv_capable = eac_is_movesr || eac_is_movec;
+wire eac_is_priv_capable = eac_is_movesr || eac_is_movec || eac_is_rte;
 wire eac_is_priv         = eac_is_priv_capable && !sr_in[13];
 
 wire eac_is_exc    = eac_is_trap || eac_is_illegal || eac_is_priv;
@@ -365,7 +395,37 @@ wire exc_vec_issue = exc_active && !exc_vec_pending && (exc_ph == EXC_VECRD);
 wire exc_vec_done  = exc_active && exc_vec_pending;
 wire exc_stall     = exc_active && !exc_vec_done;
 
-assign eaf_stall = stall_in || mem_issue || wr_stall || exc_stall;
+// RTE (milestone 16, new): a genuinely supervisor RTE (eac_is_priv already
+// false means sr_in[13] was 1) gets its own 2-beat READ sequencer -- the
+// mirror image of the exception-entry sequencer's own WRITE beats above,
+// reading back the SAME two dwords a format-$0 frame push wrote: dword0 @
+// A7 = {SR, PC_hi}, dword1 @ A7+4 = {PC_lo, FmtVec}. ret_dword0 stashes
+// the first read's result while the second is in flight (this stage's
+// only two "carry a value forward" registers, eaf_operand_a/b, are both
+// needed for the FINAL result -- the redirect target and the new A7 --
+// not an intermediate one). A privilege-violating RTE never reaches this
+// at all: eac_is_priv already took priority via eac_is_exc above, so
+// eac_is_rte_active can safely assume supervisor.
+//
+// Format $0 is assumed UNCONDITIONALLY once the pop completes -- this
+// pipeline has no mechanism that could ever have pushed anything else
+// (format $2/$3/$4/$7 don't exist here yet), so a real FMTERR fallback
+// for a stack frame this core didn't push itself is deliberately
+// deferred, not overlooked -- see header.
+wire eac_is_rte_active = eac_is_rte && !eac_is_priv;
+
+localparam RET_BEAT0 = 1'd0, RET_BEAT1 = 1'd1;
+reg        ret_ph;
+reg        ret_pending;   // this beat's read is in flight; l1_q_b valid NEXT cycle -- same shape as mem_pending
+reg [31:0] ret_dword0;    // captured {SR, PC_hi} after beat 0 completes
+
+wire ret_active   = eac_valid && eac_is_rte_active;
+wire ret_issue    = ret_active && !ret_pending;
+wire ret_complete = ret_active && ret_pending;
+wire ret_done     = ret_complete && (ret_ph == RET_BEAT1);
+wire ret_stall    = ret_active && !ret_done;
+
+assign eaf_stall = stall_in || mem_issue || wr_stall || exc_stall || ret_stall;
 assign raddr_a    = eac_src_reg;
 // A privilege violation reroutes port B to A7 REGARDLESS of what the
 // faulting instruction's own eac_dest_reg says (MOVEC's read direction
@@ -457,17 +517,24 @@ wire [31:0] exc_wdata     = (exc_ph == EXC_BEAT0)
 // special-casing (a real VBR, a separate low-memory region) is needed.
 wire [31:0] exc_vec_addr = {22'd0, exc_vec_num, 2'b00};
 
+// RTE's own two read-beat addresses: A7 (dword0), A7+4 (dword1) -- via
+// operand_a/port A, same as RTS's mem_issue/mem_complete reuse (decode set
+// eac_src_reg=A7 for RTE too, see ap040_decode.v's header).
+wire [31:0] ret_addr = (ret_ph == RET_BEAT1) ? (operand_a + 32'd4) : operand_a;
+
 // Driven unconditionally, same "compute always, gate consumption" precedent
 // as raddr_b -- harmless when none of eac_is_mem_src/eac_is_jmp/eac_is_push/
-// eac_is_exc is set, nothing reads l1_q_b or l1_wr_busy that cycle.
-// PC_RESET-relative to match ap040_inst_fetch.v's own L1 addressing -- see
-// header. Four-way select: a READ target (memory-source or JMP/JSR's
-// redirect), the BSR/JSR PUSH address, an exception frame WRITE beat, or the
-// exception's own vector-table READ -- mutually exclusive by construction
-// (an instruction is never more than one of these at once).
+// eac_is_exc/eac_is_rte_active is set, nothing reads l1_q_b or l1_wr_busy
+// that cycle. PC_RESET-relative to match ap040_inst_fetch.v's own L1
+// addressing -- see header. Five-way select: a READ target (memory-source,
+// JMP/JSR's redirect, or now RTS via the same mem_issue/mem_complete path),
+// the BSR/JSR PUSH address, an exception frame WRITE beat, the exception's
+// own vector-table READ, or RTE's own pop READ -- mutually exclusive by
+// construction (an instruction is never more than one of these at once).
 wire [31:0] l1_addr_word = eac_is_push  ? push_addr :
                             exc_writing ? exc_beat_addr :
                             (exc_vec_issue || exc_vec_pending) ? exc_vec_addr :
+                            ret_active  ? ret_addr :
                                                                   ea_target;
 assign l1_addr_b = (l1_addr_word - PC_RESET) >> 1;
 assign l1_wren_b = (eac_valid && eac_is_push) || exc_writing;
@@ -498,10 +565,15 @@ always @(posedge clk) begin
 		eaf_movec_dir  <= 1'b0;
 		eaf_movec_sel  <= 3'h0;
 		eaf_sr_snapshot<= 16'h0;
+		eaf_is_rts     <= 1'b0;
+		eaf_is_rte     <= 1'b0;
+		eaf_rte_sr_data<= 16'h0;
 		eaf_cond       <= 4'h0;
 		mem_pending    <= 1'b0;
 		exc_ph          <= EXC_BEAT0;
 		exc_vec_pending <= 1'b0;
+		ret_ph          <= RET_BEAT0;
+		ret_pending     <= 1'b0;
 	end else if (ce) begin
 		if (flush) begin
 			eaf_valid       <= 1'b0;
@@ -511,9 +583,12 @@ always @(posedge clk) begin
 			// consumes what was in progress, but exc_ph/exc_vec_pending
 			// MUST reset here too, or the next (unrelated) exception
 			// instruction would resume mid-sequence instead of starting at
-			// beat0.
+			// beat0. ret_ph/ret_pending need the same treatment for a
+			// mid-flight RTE.
 			exc_ph          <= EXC_BEAT0;
 			exc_vec_pending <= 1'b0;
+			ret_ph          <= RET_BEAT0;
+			ret_pending     <= 1'b0;
 		end else if (!stall_in) begin
 			if (mem_issue) begin
 				eaf_valid   <= 1'b0;
@@ -524,7 +599,14 @@ always @(posedge clk) begin
 				eaf_next_pc    <= eac_next_pc;
 				eaf_dest_reg   <= eac_dest_reg;
 				eaf_operand_a  <= l1_q_b;
-				eaf_operand_b  <= operand_b;
+				// RTS: the popped value (l1_q_b, into eaf_operand_a above)
+				// is the redirect target, exactly like JMP/JSR/exceptions
+				// already route through eaf_operand_a -- but this stage
+				// ALSO owes A7 its post-pop value (old+4), which is NOT
+				// what a plain MOVE.L (An),Dn would put in eaf_operand_b
+				// (that instruction's operand_b is simply unused). See
+				// header.
+				eaf_operand_b  <= eac_is_rts ? (operand_a + 32'd4) : operand_b;
 				eaf_alu_op     <= eac_alu_op;
 				eaf_writes_reg <= eac_writes_reg;
 				eaf_writes_ccr <= eac_writes_ccr;
@@ -539,6 +621,8 @@ always @(posedge clk) begin
 				eaf_is_priv    <= 1'b0;
 				eaf_is_movesr  <= 1'b0;
 				eaf_is_movec   <= 1'b0;
+				eaf_is_rts     <= eac_is_rts;
+				eaf_is_rte     <= 1'b0;
 				eaf_sr_snapshot<= sr_in;
 				eaf_cond       <= eac_cond;
 				mem_pending    <= 1'b0;
@@ -615,6 +699,13 @@ always @(posedge clk) begin
 				// instruction is never also a JMP above.
 				eaf_is_movesr  <= 1'b0;
 				eaf_is_movec   <= 1'b0;
+				// An RTE that just privilege-violated is NOT also still an
+				// RTE as far as ap040_execute.v is concerned -- same
+				// reasoning as movesr/movec above; its own pop never
+				// happened (ret_ph's sequencer never even started, gated
+				// on eac_is_rte_active).
+				eaf_is_rts     <= 1'b0;
+				eaf_is_rte     <= 1'b0;
 				// The value ap040_execute.v's exception-masking arithmetic
 				// needs -- captured HERE (this stage's own already-forwarded
 				// read), not re-read live one cycle later there, to avoid a
@@ -624,6 +715,68 @@ always @(posedge clk) begin
 				eaf_cond       <= eac_cond;
 				exc_ph          <= EXC_BEAT0;
 				exc_vec_pending <= 1'b0;
+			end else if (ret_issue) begin
+				// Posting this beat's read address (ret_addr, driven
+				// combinationally above) -- l1_q_b registers its data by
+				// next cycle, same one-cycle latency mem_issue/mem_complete
+				// and the exception's own vector-fetch already rely on.
+				eaf_valid   <= 1'b0;
+				ret_pending <= 1'b1;
+			end else if (ret_complete && ret_ph == RET_BEAT0) begin
+				// l1_q_b now holds dword0 ({SR, PC_hi}) -- stash it (this
+				// stage's carry-forward registers, eaf_operand_a/b, are
+				// both needed for the FINAL result below, not an
+				// intermediate one), advance to beat 1.
+				ret_dword0  <= l1_q_b;
+				ret_ph      <= RET_BEAT1;
+				ret_pending <= 1'b0;
+				eaf_valid   <= 1'b0;
+			end else if (ret_done) begin
+				// l1_q_b now holds dword1 ({PC_lo, FmtVec}) -- finalize.
+				// Format $0 assumed unconditionally (see header); the
+				// format word itself (l1_q_b[15:0]) is read off the stack
+				// but deliberately not consulted for behavior yet.
+				eaf_valid       <= eac_valid;
+				eaf_pc          <= eac_pc;
+				eaf_next_pc     <= eac_next_pc;
+				eaf_dest_reg    <= eac_dest_reg;   // already A7 -- unused for RTE's OWN write now, see below
+				eaf_operand_a   <= {ret_dword0[15:0], l1_q_b[31:16]};   // popped PC -> redirect target
+				eaf_operand_b   <= operand_a + 32'd8;                    // new A7 (format $0, 8-byte frame)
+				eaf_alu_op      <= eac_alu_op;
+				// NOT 1: RTE's A7 restore does NOT go through the normal
+				// commit_reg/A7-bank path at all -- see ap040_execute.v's
+				// header for the real race that forces this (RTE's own SR
+				// restore commits the SAME cycle, and would otherwise bank
+				// this very write through the NEW, just-restored S bit
+				// instead of the OLD one). eaf_operand_b (the new A7 value,
+				// still computed above) is instead consumed by
+				// ap040_execute.v's exe_writes_creg path, writing directly
+				// to ISP/MSP.
+				eaf_writes_reg  <= 1'b0;
+				eaf_writes_ccr  <= 1'b0;
+				eaf_is_branch   <= 1'b0;
+				eaf_is_scc      <= 1'b0;
+				eaf_is_dbcc     <= 1'b0;
+				eaf_is_jmp      <= 1'b0;
+				eaf_is_bsr      <= 1'b0;
+				eaf_is_jsr      <= 1'b0;
+				eaf_is_trap     <= 1'b0;
+				eaf_is_illegal  <= 1'b0;
+				eaf_is_priv     <= 1'b0;
+				eaf_is_movesr   <= 1'b0;
+				eaf_is_movec    <= 1'b0;
+				eaf_is_rts      <= 1'b0;
+				eaf_is_rte      <= 1'b1;
+				// Popped SR, masked -- ap040_execute.v's new commit source
+				// for restoring it (exe_writes_sr/exe_sr_data) -- see its
+				// header for why this needs its own field rather than
+				// reusing eaf_sr_snapshot (that one's a forwarded READ of
+				// the CURRENT live SR, not the value being ADOPTED).
+				eaf_rte_sr_data <= ret_dword0[31:16] & `AP040_SR_MASK;
+				eaf_sr_snapshot <= sr_in;
+				eaf_cond        <= eac_cond;
+				ret_ph          <= RET_BEAT0;
+				ret_pending     <= 1'b0;
 			end else begin
 				eaf_valid      <= eac_valid;
 				eaf_pc         <= eac_pc;
@@ -663,6 +816,13 @@ always @(posedge clk) begin
 				eaf_is_movec   <= eac_is_movec;
 				eaf_movec_dir  <= eac_imm[3];
 				eaf_movec_sel  <= eac_imm[2:0];
+				// RTS/RTE never reach this branch (RTS routes through
+				// mem_issue/mem_complete above, RTE through its own ret_ph
+				// sequencer or the exception path) -- zeroed here purely for
+				// the same "every field explicitly assigned in every branch"
+				// discipline every other flag already follows.
+				eaf_is_rts     <= 1'b0;
+				eaf_is_rte     <= 1'b0;
 				eaf_sr_snapshot<= sr_in;
 				eaf_cond       <= eac_cond;
 			end

@@ -31,6 +31,11 @@
 `define AP040_SR_S        13
 `define AP040_SR_M        12
 `define AP040_SR_RESET    16'h2700
+// RTE's popped-SR mask (milestone 16) -- clears the reserved bits (11,
+// 7-5) a stale/garbage stack word could otherwise set; matches
+// rtl_old/ap040_defs.svh's own S_RTE_FIN2 (`sr <= rte_sr & AP040_SR_MASK`)
+// exactly.
+`define AP040_SR_MASK     16'hF71F
 
 // MOVEC control-register selector codes (milestone 15) -- this decoder's
 // OWN compact 3-bit encoding, not the raw 12-bit MOVEC selector field
