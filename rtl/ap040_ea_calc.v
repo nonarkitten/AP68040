@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 16: RTS, RTE)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 17: address error)       //
 //                                                                          //
 // ap040_ea_calc.v - EA-calc stage                                         //
 //                                                                          //

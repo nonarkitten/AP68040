@@ -104,6 +104,7 @@ Completed milestones (`tb/run_pipe_tests.sh`, one file per milestone):
 | 14 | Exception entry: illegal instruction (vector 4), TRAP #n (vectors 32-47), format $0 (4-word) frame -- first exception-entry sequencer | `tb_ap040_pipe_exc.v` |
 | 15 | Supervisor state: real 16-bit SR, VBR/SFC/DFC/CACR, MOVEC, MOVE to SR, dynamic privilege violation (vector 8), USP/ISP/MSP banking | `tb_ap040_pipe_sup.v` |
 | 16 | RTS (reuses mem_issue/mem_complete verbatim), RTE (new 2-beat pop sequencer, format $0 only) -- the return half of BSR/JSR and illegal/TRAP/priv | `tb_ap040_pipe_rts_rte.v` |
+| 17 | Address error (vector 3) on odd JMP/JSR targets -- first format $2 (6-word, 12-byte) frame, dynamic (EA-fetch-time) detection like priv violation, JSR's push suppressed entirely for the faulting case | `tb_ap040_pipe_addrerr.v` |
 
 Register-direct/immediate/register-indirect(+displacement) only -- no
 indexed/absolute/PC-relative EA modes, no byte/word sizes yet (BSR/JSR now
@@ -779,6 +780,82 @@ milestone 15 shipped.
 Full 18-file `run_pipe_tests.sh` green (16 pipe-core tests + the new
 RTS/RTE test + the standalone `l1_wbuf` test).
 
+**DONE (milestone 17, 2026-08-27): address error (vector 3) on odd JMP/JSR
+targets -- this pipeline's first format $2 (6-word, 12-byte) exception
+frame.** Every earlier exception (illegal, TRAP, priv) is format $0 (4-word,
+8-byte); format $2 adds one extra 32-bit "faulting address" longword.
+
+- **Detection is entirely dynamic, at EA-fetch time, against the live,
+  forwarded EA target** (`ea_target[0]`) -- exactly like milestone 15's
+  privilege-violation check, and for the same reason: whether a JMP/JSR
+  target is odd isn't known until the address itself is resolved (register
+  value + displacement), which doesn't exist until `ap040_ea_fetch.v`.
+  `ap040_decode.v` needs ZERO changes for this milestone (its banner was
+  updated, its logic wasn't) -- the same "thread the flag through unchanged"
+  shape every dynamic-fault milestone since 15 has followed.
+- **JMP and JSR are genuinely different, bit-exact-verified against
+  `rtl_old/ap040_core.v`'s `S_JMP1`/`S_JSR1`, not assumed to be the same
+  shape just because both are "odd target, format $2":**
+  - JMP's stacked PC field is the JMP instruction's OWN address + 2 (the
+    faulting instruction fetch never even started forming a new PC).
+  - JSR's stacked PC field is the odd TARGET itself, raw and unrounded --
+    the fault is on the instruction fetch AT the target, so the frame names
+    that address, not the call site.
+  - JSR's stack push (the return address that would let the callee RTS
+    back) is skipped ENTIRELY for the odd-target case -- there is no return
+    address to protect if the call itself never completes. `eac_is_push`
+    now excludes `eac_is_jsr_odd` explicitly; ISP moves by exactly one
+    format-$2 frame (12 bytes), never 12+4 (a frame plus an orphaned push).
+  - Both cases' extra address-field longword IS rounded down
+    (`{ea_target[31:1], 1'b0}`) -- this is NOT the same value as JSR's PC
+    field, a real, easy-to-get-backwards distinction the test isolates
+    separately.
+- **Mechanically, the exception-entry sequencer just grew a third write
+  beat** (`EXC_BEAT2`, format-$2-only, selected by a new `eac_is_fmt2`),
+  reusing the exact same beat/vec-read/finalize shape illegal/TRAP/priv/
+  RTE's own push already established -- no new state machine, no new
+  control-flow shape, just one more localparam value and one more `case`
+  arm.
+- **A real testbench-construction bug, not RTL, caught the same way every
+  prior one in this project has been: tracing, not inspection.** The first
+  draft of `tb_ap040_pipe_addrerr.v` gave its JMP-odd handler an
+  unconditional JMP back to the (also odd) JSR instruction, expecting a
+  SEPARATE handler at a different address to catch the JSR fault -- but
+  address error is ONE vector (3) for every odd-target fault, JMP or JSR
+  alike; there is no way to route the two cases to different handlers via
+  the vector table. The JSR re-faulted through the SAME vector back into
+  the SAME handler, which unconditionally jumped back to the JSR again --
+  an infinite loop, silently draining the stack by one 12-byte frame per
+  pass forever. Visible in the failing run only as "D6 never became $22"
+  and "ISP landed at a value that didn't match the two-frames-total
+  arithmetic" -- not obviously an infinite loop from the failure message
+  alone. A cycle-by-cycle trace of `eac_pc`/`eaf_pc`/`isp` (watching ISP
+  decrement by 12 every ~10 cycles while PC kept bouncing back to the same
+  handler address) made it unambiguous. Fixed by merging the two handlers
+  into one, using an otherwise-unused data register as a one-shot entry
+  counter (`ADD.L D7,D7` to test-and-double it, `BNE.B` to branch on the
+  second entry) -- a real fix to the test's control flow, not a change to
+  what it verifies.
+- **Mutation testing**: removing `eac_is_jsr_odd`'s exclusion from
+  `eac_is_push` (caught -- the poisoned push corrupts everything
+  downstream: D4/D5 poison instructions run, the JSR frame's own beat data
+  goes wrong, CCR ends up nonzero). Forcing `exc_frame_size` to always be 8
+  (format $0's size) regardless of `eac_is_fmt2` (caught -- every
+  format-$2 field lands at the wrong beat offset, ISP arithmetic wrong).
+  Swapping JMP's `eac_pc+2` and JSR's `ea_target` PC-field formulas (caught
+  -- both frames' PC field wrong, isolated exactly to the swapped fields,
+  nothing else affected, confirming the test's granularity). Removing
+  `exc_addr_field`'s LSB-clearing (caught -- both address fields wrong by
+  exactly 1, the raw odd target instead of the rounded one). Breaking
+  `EXC_BEAT2`'s case-statement advance so format-$2 exceptions skip straight
+  from `EXC_BEAT1` to `EXC_VECRD` (caught -- the address-field beat never
+  gets written, both frames' third word reads back as whatever was already
+  in memory). All five restored and diff-confirmed clean against the
+  pre-mutation file.
+
+Full 19-file `run_pipe_tests.sh` green (17 pipe-core tests + the new
+address-error test + the standalone `l1_wbuf` test).
+
 ## 5. Verification discipline (keep doing this)
 
 This is what has actually kept the pipeline correct across twelve milestones
@@ -870,15 +947,14 @@ of rewrites; don't relax it for speed:
    real now, with USP/ISP/MSP banking proven end-to-end (an ordinary BSR
    in user mode correctly targets USP; an exception taken from user mode
    still correctly lands on ISP/MSP, never USP -- a real bug caught and
-   fixed before it could hide, see the writeup above section 5). **Still
-   NOT done**: format $2 (the 6-word frame, one extra "instruction
+   fixed before it could hide, see the writeup above section 5). **DONE
+   (milestone 17): format $2** (the 6-word frame, one extra "instruction
    address" longword) for **address error on an odd JMP/JSR target** --
-   `rtl_old`'s S_JMP1/S_JSR1 have real, mode-dependent bit-exact quirks
-   (JMP's stacked PC is `pc_i+2` regardless of gather width; JSR's is the
-   target itself, and JSR skips its push entirely rather than attempting
-   one at an odd address) verified against `ap040_core.v` but not yet
-   built here -- deliberately split into its own milestone rather than
-   guessed at alongside format $0. **`MOVE from SR`, `MOVE An,USP`/`MOVE
+   `rtl_old`'s S_JMP1/S_JSR1 real, mode-dependent bit-exact quirks (JMP's
+   stacked PC is `pc_i+2` regardless of gather width; JSR's is the target
+   itself, and JSR skips its push entirely rather than attempting one at
+   an odd address) are now built and verified here, see the writeup above
+   section 5. **`MOVE from SR`, `MOVE An,USP`/`MOVE
    USP,An`** deliberately not built (MOVEC's own selector set already
    covers USP/ISP/MSP; SR's value is observable via the new `dbg_sr` tap
    without needing an ISA instruction for it) -- add them if/when
@@ -892,9 +968,14 @@ of rewrites; don't relax it for speed:
    round trip (BSR/RTS, then TRAP-from-user-mode/RTE) rather than just
    inspecting pushed frame contents -- see the writeup above section 5,
    including a real same-cycle SR/A7-restore race it caught and fixed.
-   RTE's own format-$0-only assumption inherits format $2's own deferral
-   above -- an RTE popping a frame this pipeline could never have pushed
-   (anything but format $0) has no FMTERR fallback yet, same reasoning.
+   RTE's own format-$0-only assumption is now a REAL gap, not a moot one:
+   since milestone 17, this pipeline CAN push a format-$2 frame (address
+   error), but RTE still only knows how to pop format $0 -- an RTE
+   returning from an address-error handler would misread the frame (and
+   leave the extra address-field longword on the stack). No FMTERR
+   fallback either. Deliberately still deferred, now genuinely reachable
+   rather than hypothetical -- next in line if anything in this repo
+   needs to return from an address-error handler.
    Also still deferred: **TRAPcc**, **DBcc's branch-target parity check**,
    **CHK**/**zero-divide** (no such instructions exist yet), **trace**,
    and **bus/access-fault format $7** (needs a real BCU/MMU, explicitly

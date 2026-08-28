@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 16: RTS, RTE)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 17: address error)       //
 //                                                                          //
 // ap040_pipe_core.v - top level: wires IF/ID/EA-calc/EA-fetch/EX/WB into a //
 // real six-stage pipeline with a synchronous stall/flush chain,            //
@@ -201,6 +201,7 @@ wire        eaf_writes_reg, eaf_writes_ccr;
 wire        eaf_is_branch, eaf_is_scc, eaf_is_dbcc, eaf_is_jmp;
 wire        eaf_is_bsr, eaf_is_jsr, eaf_is_trap, eaf_is_illegal;
 wire        eaf_is_priv, eaf_is_movesr, eaf_is_movec;
+wire        eaf_is_addrerr;
 wire        eaf_movec_dir;
 wire  [2:0] eaf_movec_sel;
 wire [15:0] eaf_sr_snapshot;
@@ -672,6 +673,7 @@ ap040_ea_fetch #(
 	.eaf_is_trap      (eaf_is_trap),
 	.eaf_is_illegal   (eaf_is_illegal),
 	.eaf_is_priv      (eaf_is_priv),
+	.eaf_is_addrerr   (eaf_is_addrerr),
 	.eaf_is_movesr    (eaf_is_movesr),
 	.eaf_is_movec     (eaf_is_movec),
 	.eaf_movec_dir    (eaf_movec_dir),
@@ -708,6 +710,7 @@ ap040_execute u_ex
 	.eaf_is_trap      (eaf_is_trap),
 	.eaf_is_illegal   (eaf_is_illegal),
 	.eaf_is_priv      (eaf_is_priv),
+	.eaf_is_addrerr   (eaf_is_addrerr),
 	.eaf_is_movesr    (eaf_is_movesr),
 	.eaf_is_movec     (eaf_is_movec),
 	.eaf_movec_dir    (eaf_movec_dir),

@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 16: RTS, RTE)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 17: address error)       //
 //                                                                          //
 // ap040_execute.v - EX stage                                              //
 //                                                                          //
@@ -126,6 +126,7 @@ module ap040_execute
 	input             eaf_is_trap,
 	input             eaf_is_illegal,
 	input             eaf_is_priv,
+	input             eaf_is_addrerr,
 	input             eaf_is_movesr,
 	input             eaf_is_movec,
 	input             eaf_movec_dir,
@@ -293,16 +294,21 @@ wire writes_reg_resolved = eaf_is_dbcc ? (eaf_valid && !cond_result) : eaf_write
 // correct -- see ap040_decode.v's header), so by the time a BSR reaches EX
 // the redirect has already happened and there is nothing left to correct.
 //
-// TRAP #n / illegal instruction / privilege violation (milestones 14/15):
-// the SAME reasoning as JMP/JSR one more time -- none of the three has a
-// literal target decode could possibly speculate with (the handler address
-// comes from ap040_ea_fetch.v's own vector-table read, resolved into
-// eaf_operand_a exactly like JMP/JSR's EA -- see its header), so all three
-// join this OR-chain unconditionally. eaf_is_priv fires for a privilege
-// violation on MOVE-to-SR/MOVEC -- see ap040_ea_fetch.v's header for where
-// that's actually detected (it's dynamic, not a decode-time fact the way
-// illegal/TRAP are).
-wire exc_reaching_ex = eaf_is_trap || eaf_is_illegal || eaf_is_priv;
+// TRAP #n / illegal instruction / privilege violation / odd JMP-JSR target
+// (milestones 14/15/17): the SAME reasoning as JMP/JSR one more time --
+// none of the four has a literal target decode could possibly speculate
+// with (the handler address comes from ap040_ea_fetch.v's own vector-table
+// read, resolved into eaf_operand_a exactly like JMP/JSR's EA -- see its
+// header), so all four join this OR-chain unconditionally. eaf_is_priv
+// fires for a privilege violation on MOVE-to-SR/MOVEC/RTE; eaf_is_addrerr
+// fires for an odd JMP/JSR target -- see ap040_ea_fetch.v's header for
+// where both are actually detected (dynamic, not a decode-time fact the
+// way illegal/TRAP are). Reusing this SAME aggregate wire is also why
+// address error needed no further changes anywhere else in this file:
+// ex_mispredict/ex_recovery_pc/combined_result/exe_writes_sr_c/
+// exe_sr_data_c all key off exc_reaching_ex already, not the individual
+// flags.
+wire exc_reaching_ex = eaf_is_trap || eaf_is_illegal || eaf_is_priv || eaf_is_addrerr;
 
 // RTS/RTE (milestone 16) join the SAME unconditional-redirect club one
 // more time: RTS's popped PC (routed into eaf_operand_a exactly like

@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 16: RTS, RTE)       //
+// AP040_PIPE - MC68040-style pipelined core (milestone 17: address error)       //
 //                                                                          //
 // ap040_ea_fetch.v - EA-fetch stage                                       //
 //                                                                          //
@@ -332,6 +332,7 @@ module ap040_ea_fetch
 	output reg        eaf_is_trap,
 	output reg        eaf_is_illegal,
 	output reg        eaf_is_priv,
+	output reg        eaf_is_addrerr,
 	output reg        eaf_is_movesr,
 	output reg        eaf_is_movec,
 	output reg        eaf_movec_dir,
@@ -360,19 +361,65 @@ reg mem_pending;   // an L1 port-B request is in flight for the CURRENT eac_*
                     // instruction; its result becomes valid next cycle -- see
                     // header.
 
+// Moved ahead of eac_is_push/the exception-detection wires below (both now
+// need ea_target, milestone 17) -- iverilog requires a wire's declaration
+// to textually precede any use of it in another continuous assignment,
+// even though nothing here structurally depends on file order otherwise.
+wire fwd_a_from_ex = ex_fwd_valid && (ex_fwd_dest == eac_src_reg);
+
+// Flat 3-way select on port A: immediate, else forwarded, else the
+// regfile's own (possibly write-through-bypassed) read. eac_src_a_is_imm
+// and fwd_a_from_ex are mutually exclusive in practice (MOVEQ never has a
+// meaningful eac_src_reg), so this is one priority mux, not two stacked.
+// For a memory-source instruction this IS the effective address (An's
+// value, decode having set eac_src_reg to An's unified index) -- see header.
+wire [31:0] operand_a = eac_src_a_is_imm ? eac_imm :
+                         fwd_a_from_ex   ? ex_fwd_data :
+                                           rdata_a;
+
+// The effective address: operand_a (An's value, resolved by the mux above)
+// PLUS eac_imm (the sign-extended displacement for a (d16,An) form, or
+// exactly 0 for the plain (An) form -- see ap040_decode.v's header for why
+// id_imm is zeroed for the plain case). One formula for both EA modes and
+// both consumers (a memory-source MOVE dereferences it below; JMP uses it
+// directly as its result) -- adding a future EA mode that also produces an
+// address+offset shape (indexed, etc.) needs no new logic here, just
+// decode emitting the right eac_imm.
+wire [31:0] ea_target = operand_a + eac_imm;
+
+// Address error on an odd JMP/JSR target (milestone 17, new): a SECOND
+// dynamic exception trigger, same reasoning as eac_is_priv below -- "this
+// is a JMP/JSR" is a decode-time fact, but "the target happens to be odd"
+// depends on ea_target (above), not known until here either. Format $2
+// (the 6-word frame, one extra "instruction address" longword), not
+// format $0 -- see exc_pc_field/exc_addr_field below for the real,
+// mode-dependent bit-exact stacked-PC quirks this needed, verified
+// against ap040_core.v's own S_JMP1/S_JSR1, not guessed.
+wire eac_is_jmp_odd  = eac_is_jmp && ea_target[0];
+wire eac_is_jsr_odd  = eac_is_jsr && ea_target[0];
+wire eac_is_addrerr  = eac_is_jmp_odd || eac_is_jsr_odd;
+wire eac_is_fmt2     = eac_is_addrerr;   // the only format-$2 source so far
+
 wire mem_issue    = eac_valid && eac_is_mem_src && !mem_pending;
 wire mem_complete = mem_pending;
 // BSR/JSR's push -- no "pending" latch needed, see header: a write either
 // succeeds immediately (l1_wr_busy low) or must wait for the port, but
 // never needs a separate multi-cycle completion phase the way a read does.
-wire eac_is_push  = eac_is_bsr || eac_is_jsr;
+// eac_is_jsr_odd (milestone 17) is excluded here: an odd JSR target never
+// pushes at all, per ap040_core.v's own S_JSR1 -- it goes straight to the
+// address-error exception instead (below), the fault taken on the
+// INSTRUCTION FETCH at the odd target, not on the call itself.
+wire eac_is_push  = eac_is_bsr || (eac_is_jsr && !eac_is_jsr_odd);
 wire wr_stall     = eac_valid && eac_is_push && l1_wr_busy;
 
 // TRAP #n / illegal instruction exception entry -- see header. exc_ph
-// sequences the frame's two writes and the vector-table read one at a time;
+// sequences the frame's writes and the vector-table read one at a time;
 // exc_vec_pending mirrors mem_pending's own shape for the read's one-cycle
-// latency.
-localparam EXC_BEAT0 = 2'd0, EXC_BEAT1 = 2'd1, EXC_VECRD = 2'd2;
+// latency. EXC_BEAT2 (milestone 17, new) is a THIRD write beat, used only
+// for format $2's extra "instruction address" longword -- see
+// eac_is_fmt2/exc_writing below for why format $0 exceptions skip it
+// entirely rather than visiting an empty state.
+localparam EXC_BEAT0 = 2'd0, EXC_BEAT1 = 2'd1, EXC_BEAT2 = 2'd2, EXC_VECRD = 2'd3;
 reg [1:0] exc_ph;
 reg       exc_vec_pending;
 
@@ -386,10 +433,11 @@ reg       exc_vec_pending;
 wire eac_is_priv_capable = eac_is_movesr || eac_is_movec || eac_is_rte;
 wire eac_is_priv         = eac_is_priv_capable && !sr_in[13];
 
-wire eac_is_exc    = eac_is_trap || eac_is_illegal || eac_is_priv;
+wire eac_is_exc    = eac_is_trap || eac_is_illegal || eac_is_priv || eac_is_addrerr;
 wire exc_active    = eac_valid && eac_is_exc;
 wire exc_writing   = exc_active && !exc_vec_pending &&
-                      (exc_ph == EXC_BEAT0 || exc_ph == EXC_BEAT1);
+                      (exc_ph == EXC_BEAT0 || exc_ph == EXC_BEAT1 ||
+                       (exc_ph == EXC_BEAT2 && eac_is_fmt2));
 wire exc_beat_ack  = exc_writing && !l1_wr_busy;    // this beat accepted THIS cycle
 wire exc_vec_issue = exc_active && !exc_vec_pending && (exc_ph == EXC_VECRD);
 wire exc_vec_done  = exc_active && exc_vec_pending;
@@ -438,32 +486,11 @@ assign raddr_a    = eac_src_reg;
 // port), so there is no live conflict left to resolve here at all.
 assign raddr_b    = eac_dest_reg;
 
-wire fwd_a_from_ex = ex_fwd_valid && (ex_fwd_dest == eac_src_reg);
 wire fwd_b_from_ex = ex_fwd_valid && (ex_fwd_dest == eac_dest_reg);
-
-// Flat 3-way select on port A: immediate, else forwarded, else the
-// regfile's own (possibly write-through-bypassed) read. eac_src_a_is_imm
-// and fwd_a_from_ex are mutually exclusive in practice (MOVEQ never has a
-// meaningful eac_src_reg), so this is one priority mux, not two stacked.
-// For a memory-source instruction this IS the effective address (An's
-// value, decode having set eac_src_reg to An's unified index) -- see header.
-wire [31:0] operand_a = eac_src_a_is_imm ? eac_imm :
-                         fwd_a_from_ex   ? ex_fwd_data :
-                                           rdata_a;
 
 // Port B has no immediate case -- it's always "the destination register's
 // current value" -- so it's a flat 2-way select.
 wire [31:0] operand_b = fwd_b_from_ex ? ex_fwd_data : rdata_b;
-
-// The effective address: operand_a (An's value, resolved by the mux above)
-// PLUS eac_imm (the sign-extended displacement for a (d16,An) form, or
-// exactly 0 for the plain (An) form -- see ap040_decode.v's header for why
-// id_imm is zeroed for the plain case). One formula for both EA modes and
-// both consumers (a memory-source MOVE dereferences it below; JMP uses it
-// directly as its result) -- adding a future EA mode that also produces an
-// address+offset shape (indexed, etc.) needs no new logic here, just
-// decode emitting the right eac_imm.
-wire [31:0] ea_target = operand_a + eac_imm;
 
 // BSR/JSR's push address AND the new A7 value to commit are the SAME
 // expression, from operand_b (A7's current value via port B, decode having
@@ -493,24 +520,57 @@ wire [31:0] push_addr = operand_b - 32'd4;
 // real, live SR now (was a fixed system-byte constant over just CCR before
 // this milestone), so the pushed word is simply the value being saved,
 // exactly as architecturally required.
+//
+// exc_frame_size (milestone 17, new): format $2 is 12 bytes (6 words),
+// format $0 is 8 (4 words) -- the ONLY difference in overall frame shape
+// this milestone introduces; everything else about the sequencer (which
+// stack, how M/S select it) is unchanged.
 wire [31:0] exc_sp_bank    = sr_in[12] ? msp_in : isp_in;   // M selects ISP vs MSP; S is irrelevant here
-wire [31:0] exc_new_sp     = exc_sp_bank - 32'd8;
+wire [31:0] exc_frame_size = eac_is_fmt2 ? 32'd12 : 32'd8;
+wire [31:0] exc_new_sp     = exc_sp_bank - exc_frame_size;
 wire [15:0] exc_sr_word    = sr_in;
 // Illegal and privilege violation both stack the FAULTING instruction's OWN
 // address (go_illegal's/go_priv's shared pc_i convention -- you can't
 // "return past" either kind of fault); TRAP stacks the FOLLOWING
 // instruction's (its return address, a subroutine call).
-wire [31:0] exc_pc_field   = (eac_is_illegal || eac_is_priv) ? eac_pc : eac_next_pc;
-wire  [7:0] exc_vec_num    = eac_is_illegal ? 8'd4 : eac_is_priv ? 8'd8 : eac_imm[7:0];
-wire [15:0] exc_vecoff_word = {4'd0, 2'b00, exc_vec_num, 2'b00};
+//
+// Odd JMP/JSR target (milestone 17, new): NEITHER of the above two
+// conventions -- verified against ap040_core.v's own S_JMP1/S_JSR1, not
+// guessed, and the two are genuinely DIFFERENT from each other:
+//   JMP:  pc_i+2 -- gencpu's i_JMP already did incpc(2) before the fault
+//         is even detected, regardless of how many extension words this
+//         JMP gathered; this decoder's own id_next_pc (held_pc+2+width)
+//         would be WRONG here for the (d16,An) form specifically, since
+//         real hardware's "+2" reflects the OPCODE WORD alone, not the
+//         whole gathered instruction -- eac_pc+2 is used directly instead.
+//         (The v24 AE corpus's OTHER value, pc_i+6 for indexed/absolute-
+//         long modes, doesn't apply: this decoder has neither mode.)
+//   JSR:  ea_target ITSELF, not any PC-relative value at all -- unlike
+//         JMP, a 68040 takes an odd JSR's fault on the INSTRUCTION FETCH
+//         at the odd target, so the frame names THAT target, not the
+//         call site. This is also why JSR's push never happens for this
+//         case (see eac_is_push above) -- there is no return address to
+//         protect if the call itself never completes.
+wire [31:0] exc_pc_field   = eac_is_jmp_odd ? (eac_pc + 32'd2) :
+                              eac_is_jsr_odd ? ea_target :
+                              (eac_is_illegal || eac_is_priv) ? eac_pc : eac_next_pc;
+wire  [7:0] exc_vec_num    = eac_is_illegal ? 8'd4 : eac_is_priv ? 8'd8 :
+                              eac_is_addrerr ? 8'd3 : eac_imm[7:0];
+wire [15:0] exc_vecoff_word = {eac_is_fmt2 ? 4'd2 : 4'd0, 2'b00, exc_vec_num, 2'b00};
+// Format $2's own extra "instruction address" longword -- the odd target
+// itself, LSB cleared (ap040_core.v's own convention for this field,
+// identical for both JMP and JSR despite their differing PC fields above).
+wire [31:0] exc_addr_field = {ea_target[31:1], 1'b0};
 
 // Beat0 @ exc_new_sp: SR, then PC's high word. Beat1 @ exc_new_sp+4: PC's
-// low word, then the format/vector-offset word -- four 16-bit frame words
-// packed into two 32-bit L1 writes, see header.
-wire [31:0] exc_beat_addr = (exc_ph == EXC_BEAT1) ? (exc_new_sp + 32'd4) : exc_new_sp;
-wire [31:0] exc_wdata     = (exc_ph == EXC_BEAT0)
-                             ? {exc_sr_word, exc_pc_field[31:16]}
-                             : {exc_pc_field[15:0], exc_vecoff_word};
+// low word, then the format/vector-offset word. Beat2 @ exc_new_sp+8
+// (format $2 only): the extra address field -- five/six 16-bit frame
+// words packed into two or three 32-bit L1 writes, see header.
+wire [31:0] exc_beat_addr = (exc_ph == EXC_BEAT2) ? (exc_new_sp + 32'd8) :
+                             (exc_ph == EXC_BEAT1) ? (exc_new_sp + 32'd4) : exc_new_sp;
+wire [31:0] exc_wdata     = (exc_ph == EXC_BEAT0) ? {exc_sr_word, exc_pc_field[31:16]} :
+                             (exc_ph == EXC_BEAT1) ? {exc_pc_field[15:0], exc_vecoff_word} :
+                                                       exc_addr_field;   // EXC_BEAT2
 
 // Vector table address: vector*4, used as an ABSOLUTE address fed through
 // the SAME PC_RESET-relative conversion below -- see header for why no
@@ -560,6 +620,7 @@ always @(posedge clk) begin
 		eaf_is_trap    <= 1'b0;
 		eaf_is_illegal <= 1'b0;
 		eaf_is_priv    <= 1'b0;
+		eaf_is_addrerr <= 1'b0;
 		eaf_is_movesr  <= 1'b0;
 		eaf_is_movec   <= 1'b0;
 		eaf_movec_dir  <= 1'b0;
@@ -619,6 +680,7 @@ always @(posedge clk) begin
 				eaf_is_trap    <= 1'b0;
 				eaf_is_illegal <= 1'b0;
 				eaf_is_priv    <= 1'b0;
+				eaf_is_addrerr <= 1'b0;
 				eaf_is_movesr  <= 1'b0;
 				eaf_is_movec   <= 1'b0;
 				eaf_is_rts     <= eac_is_rts;
@@ -639,9 +701,20 @@ always @(posedge clk) begin
 				// advance to the next beat. Otherwise the port's still
 				// busy: hold exc_ph, retry the SAME beat next cycle (eac_*
 				// stays frozen via exc_stall, exactly like wr_stall above).
+				// After beat 1, format $2 needs one more beat (EXC_BEAT2,
+				// the extra address field); format $0 skips straight to
+				// the vector-table read -- exc_writing's own gating above
+				// already ensures EXC_BEAT2 is never ENTERED for a format
+				// $0 exception, so no separate check is needed once we're
+				// actually leaving beat 2.
 				eaf_valid <= 1'b0;
-				if (exc_beat_ack)
-					exc_ph <= (exc_ph == EXC_BEAT0) ? EXC_BEAT1 : EXC_VECRD;
+				if (exc_beat_ack) begin
+					case (exc_ph)
+						EXC_BEAT0: exc_ph <= EXC_BEAT1;
+						EXC_BEAT1: exc_ph <= eac_is_fmt2 ? EXC_BEAT2 : EXC_VECRD;
+						default:   exc_ph <= EXC_VECRD;   // EXC_BEAT2 done
+					endcase
+				end
 			end else if (exc_vec_issue) begin
 				// Both frame writes are posted; the vector-table address is
 				// being driven THIS cycle (l1_addr_b, see the combinational
@@ -662,14 +735,17 @@ always @(posedge clk) begin
 				eaf_pc         <= eac_pc;
 				eaf_next_pc    <= eac_next_pc;
 				// eac_dest_reg is ALREADY A7 for illegal/TRAP/MOVE-to-SR/
-				// MOVEC-write (decode's static "dummy anchor" trick, same as
-				// BSR/JSR) -- the one case that genuinely needs overriding
-				// here is a privilege violation on MOVEC's READ direction,
-				// where eac_dest_reg is Rn (the instruction's own, now-
-				// suppressed, real destination): the exception's OWN result
-				// (the new supervisor SP, see exc_sp_bank above) must commit
-				// to A7, not Rn.
-				eaf_dest_reg   <= eac_is_priv ? 4'd15 : eac_dest_reg;
+				// MOVEC-write/JSR (decode's static "dummy anchor" trick,
+				// same as BSR) -- the cases that genuinely need overriding
+				// here are a privilege violation on MOVEC's READ direction
+				// (eac_dest_reg is Rn, the instruction's own, now-
+				// suppressed, real destination) and an odd JMP target
+				// (JMP, unlike JSR, writes NO register at all normally, so
+				// decode never pointed eac_dest_reg at A7 for it in the
+				// first place): the exception's OWN result (the new
+				// supervisor SP, see exc_sp_bank above) must commit to A7
+				// in both cases, not whatever eac_dest_reg otherwise says.
+				eaf_dest_reg   <= (eac_is_priv || eac_is_addrerr) ? 4'd15 : eac_dest_reg;
 				eaf_operand_a  <= l1_q_b;
 				eaf_operand_b  <= exc_new_sp;
 				eaf_alu_op     <= eac_alu_op;
@@ -692,11 +768,16 @@ always @(posedge clk) begin
 				eaf_is_trap    <= eac_is_trap;
 				eaf_is_illegal <= eac_is_illegal;
 				eaf_is_priv    <= eac_is_priv;
+				eaf_is_addrerr <= eac_is_addrerr;
 				// The original (now-suppressed) instruction's own semantics
 				// must not reach EX -- a MOVEC/MOVE-to-SR that just faulted
 				// is NOT also still a MOVEC/MOVE-to-SR as far as
 				// ap040_execute.v is concerned, exactly like a mem-source
-				// instruction is never also a JMP above.
+				// instruction is never also a JMP above. Same for an odd
+				// JMP/JSR target -- it is NOT also still a JMP/JSR (its
+				// normal redirect never happened; the exception's own
+				// target, from the vector table, is what eaf_operand_a
+				// carries instead).
 				eaf_is_movesr  <= 1'b0;
 				eaf_is_movec   <= 1'b0;
 				// An RTE that just privilege-violated is NOT also still an
@@ -763,6 +844,7 @@ always @(posedge clk) begin
 				eaf_is_trap     <= 1'b0;
 				eaf_is_illegal  <= 1'b0;
 				eaf_is_priv     <= 1'b0;
+				eaf_is_addrerr  <= 1'b0;
 				eaf_is_movesr   <= 1'b0;
 				eaf_is_movec    <= 1'b0;
 				eaf_is_rts      <= 1'b0;
@@ -812,6 +894,11 @@ always @(posedge clk) begin
 				// "genuinely not faulting" case, no additional gating
 				// needed.
 				eaf_is_priv    <= 1'b0;
+				// Same reasoning for an odd JMP/JSR target: only a
+				// genuinely EVEN target ever reaches this plain redirect
+				// path (eac_is_addrerr routes the odd case into
+				// exc_writing/exc_vec_issue/exc_vec_done above instead).
+				eaf_is_addrerr <= 1'b0;
 				eaf_is_movesr  <= eac_is_movesr;
 				eaf_is_movec   <= eac_is_movec;
 				eaf_movec_dir  <= eac_imm[3];
